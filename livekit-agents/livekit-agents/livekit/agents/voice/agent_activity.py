@@ -119,14 +119,14 @@ class AgentActivity(RecognitionHooks):
         self._false_interruption_timer: asyncio.TimerHandle | None = None
         self._interrupt_paused_speech_task: asyncio.Task[None] | None = None
 
-        # for forced interruption after 10 seconds of user speech
-        self._user_speech_start_time: float | None = None
-        self._forced_interruption_timer: asyncio.TimerHandle | None = None
-        self._forced_interruption_triggered: bool = False
+        # for real-time fact-checking and interruption on factual errors
+        self._last_checked_transcript: str = ""
+        self._user_transcript_buffer: list[str] = []  # Accumulate user messages for context
         self._agent_speech_start_time: float | None = None
         self._is_agent_speaking: bool = False
         self._bypass_user_silence_wait: bool = False  # Set to True during forced interruption
-        self._speech_duration_log_timer: asyncio.TimerHandle | None = None
+        self._fact_check_task: asyncio.Task | None = None
+        logger.info("[FACT-CHECK] Initialized real-time fact-checking system")
 
         # fired when a speech_task finishes or when a new speech_handle is scheduled
         # this is used to wake up the main task when the scheduling state changes
@@ -1212,13 +1212,109 @@ class AgentActivity(RecognitionHooks):
 
                 self._current_speech.interrupt()
     
-    async def _force_agent_interruption(self) -> None:
-        """
-        Force the agent to interrupt the user after 10 seconds of continuous speech.
-        The agent will say an interruption message and continue speaking.
+    async def _check_for_factual_errors(self, transcript: str) -> None:
+        """Check transcript for factual errors using OpenAI with conversation context."""
+        # Don't interrupt while agent is speaking
+        if self._is_agent_speaking:
+            return
+        
+        # Don't check the same text twice
+        if transcript == self._last_checked_transcript:
+            return
+        
+        # Better filtering: need at least 7 words
+        words = transcript.split()
+        if len(words) < 7:
+            return
+        
+        # Skip if doesn't end with sentence-ending punctuation (incomplete thought)
+        transcript_stripped = transcript.strip()
+        if not transcript_stripped:
+            return
+        if not transcript_stripped[-1] in '.!?':
+            # Allow sentences without punctuation if they're long enough (15+ words)
+            if len(words) < 15:
+                return
+        
+        self._last_checked_transcript = transcript
+        
+        # Use OpenAI to check for factual errors
+        import openai
+        
+        client = openai.AsyncOpenAI()  # Uses OPENAI_API_KEY from environment
+        
+        # Build context from conversation buffer (last 3-5 messages only for recency)
+        full_context = " ".join(self._user_transcript_buffer[-5:])  # Last 5 messages only
+        if transcript not in full_context:
+            full_context = full_context + " " + transcript
+        
+        # Keep context short and recent (max ~100 words)
+        context_words = full_context.split()
+        if len(context_words) > 100:
+            full_context = " ".join(context_words[-100:])
+        
+        prompt = (
+            f"Analyze this statement for factual errors:\\n\\n"
+            f"STATEMENT: \\\"{transcript}\\\"\\n\\n"
+            f"RULES:\\n"
+            f"1. ONLY flag CLEAR, VERIFIABLE factual errors (wrong math, wrong geography, wrong science, wrong historical facts)\\n"
+            f"2. Ignore opinions, incomplete sentences, grammar issues, or statements without specific factual claims\\n"
+            f"3. If there is a factual error, respond: INCORRECT: [1-2 sentence correction]\\n"
+            f"4. Otherwise respond: CORRECT\\n\\n"
+            f"EXAMPLES:\\n"
+            f"- 'two plus two equals five' → INCORRECT: Two plus two equals four\\n"
+            f"- 'Paris is in Germany' → INCORRECT: Paris is the capital of France\\n"
+            f"- 'water boils at 50 degrees' → INCORRECT: Water boils at 100°C at sea level\\n"
+            f"- 'the Earth is flat' → INCORRECT: The Earth is approximately spherical\\n"
+            f"- 'I was a bit shocked' → CORRECT (no factual claim)\\n"
+            f"- 'I think it's interesting' → CORRECT (opinion)"
+        )
+        
+        logger.info(f"[FACT-CHECK] Checking with context ({len(full_context.split())} words): {transcript}")
+        
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a strict fact-checker analyzing conversations. Use the full conversation context to identify factual errors. Only flag clear, verifiable factual mistakes. Ignore grammar, opinions, and incomplete thoughts."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.05,  # Very deterministic
+                max_tokens=150,
+            )
+            
+            result = response.choices[0].message.content.strip()
+            logger.info(f"[FACT-CHECK] Result: {result}")
+            
+            # Check if factual error was found
+            if result.startswith("INCORRECT:"):
+                correction = result.replace("INCORRECT:", "").strip()
+                logger.warning(f"[FACT-CHECK] 🚨 FACTUAL ERROR DETECTED! 🚨")
+                logger.warning(f"[FACT-CHECK] Context: {full_context}")
+                logger.warning(f"[FACT-CHECK] Wrong statement: {transcript}")
+                logger.warning(f"[FACT-CHECK] Correction: {correction}")
+                
+                # Clear conversation buffer to avoid re-flagging this same error
+                self._user_transcript_buffer.clear()
+                logger.info("[FACT-CHECK] Cleared conversation buffer after correction")
+                
+                # Trigger interruption with the correction
+                await self._force_agent_interruption(correction)
+                
+        except asyncio.CancelledError:
+            logger.debug(f"[FACT-CHECK] Check cancelled for: {transcript}")
+        except Exception as e:
+            logger.error(f"[FACT-CHECK] Error during fact-checking: {e}", exc_info=True)
+    
+    async def _force_agent_interruption(self, correction_message: str) -> None:
+        """  
+        Force the agent to interrupt the user with a factual correction.
+        
+        Args:
+            correction_message: The correction message from the fact-checker
         """
         try:
-            logger.warning("[INTERRUPT] >>> Agent interrupting user after 10s <<<")
+            logger.warning("[FACT-CHECK] >>> Agent interrupting to correct factual error <<<")
             
             # Mark that agent is now speaking FIRST (before everything else)
             self._is_agent_speaking = True
@@ -1238,19 +1334,18 @@ class AgentActivity(RecognitionHooks):
             # CRITICAL: Force the user silence event to be set so speech can be scheduled
             self._user_silence_event.set()
             
-            # Use _generate_reply directly with the system message to interrupt
-            chat_ctx = self.retrieve_chat_ctx().copy()
-            
-            # Add a system message to guide the interruption
+            # Use _generate_reply with clear, direct correction instruction
+            # Important: Keep it simple to avoid triggering unrelated tool calls
             system_instruction = (
-                "INTERRUPT NOW: The user has been speaking for a long time without stopping. "
-                "Say 'Sorry for interrupting,' then give a brief, relevant response to what they were saying. "
-                "Keep it concise and natural."
+                f"The user just made a factual error. "
+                f"Politely say: 'Actually, {correction_message}' "
+                f"Keep your response to exactly that - no tools, no extra information."
             )
             
-            # Generate the reply with the interruption instruction
+            # Generate the reply with the correction (disable tools to prevent unrelated calls)
             handle = self._generate_reply(
                 instructions=system_instruction,
+                tool_choice="none",  # Disable tools during corrections
                 allow_interruptions=False,  # Protected for first 5 seconds
                 schedule_speech=True,
             )
@@ -1268,7 +1363,7 @@ class AgentActivity(RecognitionHooks):
             asyncio.create_task(_enable_interruptions_after_delay())
             
         except Exception as e:
-            logger.error(f"[INTERRUPT] Error in force interruption: {e}", exc_info=True)
+            logger.error(f"[FACT-CHECK] Error in force interruption: {e}", exc_info=True)
             self._is_agent_speaking = False
             self._agent_speech_start_time = None
             self._bypass_user_silence_wait = False
@@ -1283,40 +1378,6 @@ class AgentActivity(RecognitionHooks):
             # cancel the timer when user starts speaking but leave the paused state unchanged
             self._false_interruption_timer.cancel()
             self._false_interruption_timer = None
-        
-        # Track user speech start time and schedule forced interruption after 10 seconds
-        if self._user_speech_start_time is None:
-            self._user_speech_start_time = time.time()
-            self._forced_interruption_triggered = False
-            
-            # Schedule forced interruption after 10 seconds
-            def _on_forced_interruption() -> None:
-                self._forced_interruption_triggered = True
-                self._forced_interruption_timer = None
-                # Trigger the forced interruption
-                asyncio.create_task(self._force_agent_interruption())
-            
-            if self._forced_interruption_timer:
-                self._forced_interruption_timer.cancel()
-            
-            self._forced_interruption_timer = self._session._loop.call_later(
-                10.0, _on_forced_interruption
-            )
-            
-            # Start periodic logging of speech duration
-            def _log_speech_duration() -> None:
-                if self._user_speech_start_time is not None:
-                    duration = int(time.time() - self._user_speech_start_time)
-                    logger.info(f"[INTERRUPT] User speaking for {duration}s")
-                    # Schedule next log in 1 second
-                    self._speech_duration_log_timer = self._session._loop.call_later(
-                        1.0, _log_speech_duration
-                    )
-            
-            # Start logging after 1 second
-            self._speech_duration_log_timer = self._session._loop.call_later(
-                1.0, _log_speech_duration
-            )
 
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None:
         speech_end_time = time.time()
@@ -1327,19 +1388,6 @@ class AgentActivity(RecognitionHooks):
             last_speaking_time=speech_end_time,
         )
         self._user_silence_event.set()
-        
-        # Clear user speech tracking and cancel timers
-        if self._user_speech_start_time is not None:
-            self._user_speech_start_time = None
-            self._forced_interruption_triggered = False
-            
-        if self._forced_interruption_timer:
-            self._forced_interruption_timer.cancel()
-            self._forced_interruption_timer = None
-            
-        if self._speech_duration_log_timer:
-            self._speech_duration_log_timer.cancel()
-            self._speech_duration_log_timer = None
 
         if (
             self._paused_speech
@@ -1387,6 +1435,9 @@ class AgentActivity(RecognitionHooks):
                 speaker_id=ev.alternatives[0].speaker_id,
             ),
         )
+        
+        # Don't fact-check interim transcripts - they get cancelled too fast
+        # Only check final transcripts for better accuracy
 
         if ev.alternatives[0].text and self._turn_detection not in (
             "manual",
@@ -1415,6 +1466,18 @@ class AgentActivity(RecognitionHooks):
                 speaker_id=ev.alternatives[0].speaker_id,
             ),
         )
+        
+        # Add to conversation buffer for context
+        transcript_text = ev.alternatives[0].text
+        if transcript_text:
+            self._user_transcript_buffer.append(transcript_text)
+            # Keep only last 15 messages to avoid memory bloat
+            if len(self._user_transcript_buffer) > 15:
+                self._user_transcript_buffer.pop(0)
+            
+            # Trigger fact-checking on final transcripts (PRIORITY - more complete)
+            self._fact_check_task = asyncio.create_task(self._check_for_factual_errors(transcript_text))
+        
         # agent speech might not be interrupted if VAD failed and a final transcript is received
         # we call _interrupt_by_audio_activity (idempotent) to pause the speech, if possible
         # which will also be immediately interrupted
