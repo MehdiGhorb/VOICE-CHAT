@@ -119,6 +119,15 @@ class AgentActivity(RecognitionHooks):
         self._false_interruption_timer: asyncio.TimerHandle | None = None
         self._interrupt_paused_speech_task: asyncio.Task[None] | None = None
 
+        # for forced interruption after 10 seconds of user speech
+        self._user_speech_start_time: float | None = None
+        self._forced_interruption_timer: asyncio.TimerHandle | None = None
+        self._forced_interruption_triggered: bool = False
+        self._agent_speech_start_time: float | None = None
+        self._is_agent_speaking: bool = False
+        self._bypass_user_silence_wait: bool = False  # Set to True during forced interruption
+        logger.info("[INTERRUPT] Initialized forced interruption system (10s trigger, 5s min agent speech)")
+
         # fired when a speech_task finishes or when a new speech_handle is scheduled
         # this is used to wake up the main task when the scheduling state changes
         self._q_updated = asyncio.Event()
@@ -1017,9 +1026,11 @@ class AgentActivity(RecognitionHooks):
                 _, _, speech = heapq.heappop(self._speech_q)
                 if speech.done():
                     # skip done speech (interrupted when it's in the queue)
+                    logger.debug("[INTERRUPT] Skipping done speech from queue")
                     self._current_speech = None
                     continue
                 self._current_speech = speech
+                logger.info(f"[INTERRUPT] Starting speech generation, allow_interruptions={speech.allow_interruptions}")
                 if self.min_consecutive_speech_delay > 0.0:
                     await asyncio.sleep(
                         self.min_consecutive_speech_delay - (time.time() - last_playout_ts)
@@ -1027,10 +1038,13 @@ class AgentActivity(RecognitionHooks):
                     # check again if speech is done after sleep delay
                     if speech.done():
                         # skip done speech (interrupted during delay)
+                        logger.debug("[INTERRUPT] Speech was interrupted during delay")
                         self._current_speech = None
                         continue
                 speech._authorize_generation()
+                logger.info("[INTERRUPT] Speech generation authorized - waiting for completion")
                 await speech._wait_for_generation()
+                logger.info("[INTERRUPT] Speech generation completed")
                 self._current_speech = None
                 last_playout_ts = time.time()
 
@@ -1166,6 +1180,7 @@ class AgentActivity(RecognitionHooks):
 
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
             # ignore if realtime model has turn detection enabled
+            logger.debug("[INTERRUPT] Skipping interruption - realtime model has turn detection")
             return
 
         if (
@@ -1177,6 +1192,7 @@ class AgentActivity(RecognitionHooks):
 
             # TODO(long): better word splitting for multi-language
             if len(split_words(text, split_character=True)) < opt.min_interruption_words:
+                logger.debug(f"[INTERRUPT] Not enough words for interruption: {text}")
                 return
 
         if self._rt_session is not None:
@@ -1187,6 +1203,7 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
             and self._current_speech.allow_interruptions
         ):
+            logger.info("[INTERRUPT] Interrupting current agent speech due to user activity")
             self._paused_speech = self._current_speech
 
             # reset the false interruption timer
@@ -1197,11 +1214,70 @@ class AgentActivity(RecognitionHooks):
             if use_pause and self._session.output.audio and self._session.output.audio.can_pause:
                 self._session.output.audio.pause()
                 self._session._update_agent_state("listening")
+                logger.debug("[INTERRUPT] Audio paused")
             else:
                 if self._rt_session is not None:
                     self._rt_session.interrupt()
 
                 self._current_speech.interrupt()
+                logger.debug("[INTERRUPT] Speech interrupted")
+        else:
+            if self._current_speech is None:
+                logger.debug("[INTERRUPT] No current speech to interrupt")
+            elif self._current_speech.interrupted:
+                logger.debug("[INTERRUPT] Speech already interrupted")
+            elif not self._current_speech.allow_interruptions:
+                logger.debug("[INTERRUPT] Current speech does not allow interruptions")
+    
+    async def _force_agent_interruption(self) -> None:
+        """
+        Force the agent to interrupt the user after 10 seconds of continuous speech.
+        The agent will say an interruption message and continue speaking.
+        """
+        try:
+            logger.warning("[INTERRUPT] Force interruption triggered - generating agent response")
+            
+            # Mark that agent is now speaking FIRST (before everything else)
+            self._is_agent_speaking = True
+            self._agent_speech_start_time = time.time()
+            self._bypass_user_silence_wait = True  # BYPASS the user silence wait
+            logger.info(f"[INTERRUPT] Agent speech started at {self._agent_speech_start_time}, bypass_wait=True")
+            chat_ctx = self.retrieve_chat_ctx().copy()
+            
+            # Add a system message to guide the interruption
+            system_instruction = (
+                "INTERRUPT NOW: The user has been speaking for a long time without stopping. "
+                "Say 'Sorry for interrupting,' then give a brief, relevant response to what they were saying. "
+                "Keep it concise and natural."
+            )
+            
+            # Generate the reply with the interruption instruction
+            handle = self._generate_reply(
+                instructions=system_instruction,
+                allow_interruptions=False,  # Protected for first 5 seconds
+                schedule_speech=True,
+            )
+            
+            logger.info("[INTERRUPT] Forced agent speech scheduled")
+            
+            # Wait for at least 5 seconds before allowing interruptions again
+            async def _enable_interruptions_after_delay():
+                await asyncio.sleep(5.0)
+                agent_speech_duration = time.time() - (self._agent_speech_start_time or time.time())
+                logger.info(f"[INTERRUPT] Agent has spoken for {agent_speech_duration:.2f}s - enabling interruptions")
+                self._is_agent_speaking = False
+                self._agent_speech_start_time = None
+                self._bypass_user_silence_wait = False  # Re-enable normal behavior
+                # Now allow the speech to be interrupted
+                if handle and not handle.interrupted:
+                    handle.allow_interruptions = True
+            
+            asyncio.create_task(_enable_interruptions_after_delay())
+            
+        except Exception as e:
+            logger.error(f"[INTERRUPT] Error in force interruption: {e}", exc_info=True)
+            self._is_agent_speaking = False
+            self._agent_speech_start_time = None
 
     # region recognition hooks
 
@@ -1213,6 +1289,27 @@ class AgentActivity(RecognitionHooks):
             # cancel the timer when user starts speaking but leave the paused state unchanged
             self._false_interruption_timer.cancel()
             self._false_interruption_timer = None
+        
+        # Track user speech start time and schedule forced interruption after 10 seconds
+        if self._user_speech_start_time is None:
+            self._user_speech_start_time = time.time()
+            self._forced_interruption_triggered = False
+            logger.info(f"[INTERRUPT] User started speaking at {self._user_speech_start_time}")
+            
+            # Schedule forced interruption after 10 seconds
+            def _on_forced_interruption() -> None:
+                logger.warning("[INTERRUPT] 10 second timer triggered - forcing agent interruption")
+                self._forced_interruption_triggered = True
+                self._forced_interruption_timer = None
+                # Trigger the forced interruption
+                asyncio.create_task(self._force_agent_interruption())
+            
+            if self._forced_interruption_timer:
+                self._forced_interruption_timer.cancel()
+            
+            self._forced_interruption_timer = self._session._loop.call_later(
+                10.0, _on_forced_interruption
+            )
 
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None:
         speech_end_time = time.time()
@@ -1223,6 +1320,18 @@ class AgentActivity(RecognitionHooks):
             last_speaking_time=speech_end_time,
         )
         self._user_silence_event.set()
+        
+        # Clear user speech tracking and cancel forced interruption timer
+        if self._user_speech_start_time is not None:
+            duration = time.time() - self._user_speech_start_time
+            logger.info(f"[INTERRUPT] User stopped speaking after {duration:.2f}s")
+            self._user_speech_start_time = None
+            self._forced_interruption_triggered = False
+            
+        if self._forced_interruption_timer:
+            logger.info("[INTERRUPT] Cancelling forced interruption timer (user stopped speaking)")
+            self._forced_interruption_timer.cancel()
+            self._forced_interruption_timer = None
 
         if (
             self._paused_speech
@@ -1235,6 +1344,17 @@ class AgentActivity(RecognitionHooks):
         if self._turn_detection in ("manual", "realtime_llm"):
             # ignore vad inference done event if turn_detection is manual or realtime_llm
             return
+        
+        # Protect agent speech for minimum 5 seconds after forced interruption
+        if self._is_agent_speaking and self._agent_speech_start_time is not None:
+            agent_speech_duration = time.time() - self._agent_speech_start_time
+            if agent_speech_duration < 5.0:
+                logger.debug(f"[INTERRUPT] Blocking user interruption - agent has only spoken for {agent_speech_duration:.2f}s (need 5s)")
+                return
+            else:
+                logger.info(f"[INTERRUPT] Agent has spoken for {agent_speech_duration:.2f}s - allowing interruptions")
+                self._is_agent_speaking = False
+                self._agent_speech_start_time = None
 
         if ev.speech_duration >= self._session.options.min_interruption_duration:
             self._interrupt_by_audio_activity()
@@ -1616,7 +1736,15 @@ class AgentActivity(RecognitionHooks):
         audio_output = self._session.output.audio if self._session.output.audio_enabled else None
 
         wait_for_authorization = asyncio.ensure_future(speech_handle._wait_for_authorization())
-        wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
+        # BYPASS user silence wait if we're forcing interruption
+        if self._bypass_user_silence_wait:
+            logger.info("[INTERRUPT] Bypassing user silence wait - forcing speech to start immediately")
+            wait_for_user_silence = asyncio.Future()
+            wait_for_user_silence.set_result(None)  # Already completed
+        else:
+            wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
         await speech_handle.wait_if_not_interrupted([wait_for_authorization, wait_for_user_silence])
         speech_handle._clear_authorization()
 
@@ -1879,7 +2007,15 @@ class AgentActivity(RecognitionHooks):
         self._session._update_agent_state("thinking")
 
         wait_for_authorization = asyncio.ensure_future(speech_handle._wait_for_authorization())
-        wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
+        # BYPASS user silence wait if we're forcing interruption
+        if self._bypass_user_silence_wait:
+            logger.info("[INTERRUPT] Bypassing user silence wait in LLM reply - forcing speech")
+            wait_for_user_silence = asyncio.Future()
+            wait_for_user_silence.set_result(None)
+        else:
+            wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
         await speech_handle.wait_if_not_interrupted([wait_for_authorization, wait_for_user_silence])
         speech_handle._clear_authorization()
 
@@ -2155,7 +2291,15 @@ class AgentActivity(RecognitionHooks):
 
         # realtime_reply_task is called only when there's text input, native audio input is handled by _realtime_generation_task
         wait_for_authorization = asyncio.ensure_future(speech_handle._wait_for_authorization())
-        wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
+        # BYPASS user silence wait if we're forcing interruption
+        if self._bypass_user_silence_wait:
+            logger.info("[INTERRUPT] Bypassing user silence wait in realtime reply - forcing speech")
+            wait_for_user_silence = asyncio.Future()
+            wait_for_user_silence.set_result(None)
+        else:
+            wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
         await speech_handle.wait_if_not_interrupted([wait_for_authorization, wait_for_user_silence])
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(wait_for_authorization, wait_for_user_silence)
@@ -2248,7 +2392,15 @@ class AgentActivity(RecognitionHooks):
         tool_ctx = llm.ToolContext(self.tools)
 
         wait_for_authorization = asyncio.ensure_future(speech_handle._wait_for_authorization())
-        wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
+        # BYPASS user silence wait if we're forcing interruption
+        if self._bypass_user_silence_wait:
+            logger.info("[INTERRUPT] Bypassing user silence wait in audio forwarding - forcing speech")
+            wait_for_user_silence = asyncio.Future()
+            wait_for_user_silence.set_result(None)
+        else:
+            wait_for_user_silence = asyncio.ensure_future(self._user_silence_event.wait())
+        
         await speech_handle.wait_if_not_interrupted([wait_for_authorization, wait_for_user_silence])
         speech_handle._clear_authorization()
 

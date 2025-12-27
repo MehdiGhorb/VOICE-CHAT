@@ -30,8 +30,9 @@ async def entrypoint(ctx: JobContext):
     )
     
     # Use your own API keys directly (not LiveKit's managed services)
-    session = AgentSession(
-        vad=silero.VAD.load(),
+    # VAD is required for the interruption system to work
+    session = AgentSession( 
+        vad=silero.VAD.load(),  # Required for interruption detection
         stt=deepgram.STT(),  # Uses DEEPGRAM_API_KEY from .env.local
         llm=openai.LLM(model="gpt-4o-mini"),  # Uses OPENAI_API_KEY from .env.local
         tts=cartesia.TTS(voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),  # Uses CARTESIA_API_KEY from .env.local
