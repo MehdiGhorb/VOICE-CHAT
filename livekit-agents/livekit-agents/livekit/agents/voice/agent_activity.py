@@ -1231,9 +1231,19 @@ class AgentActivity(RecognitionHooks):
         transcript_stripped = transcript.strip()
         if not transcript_stripped:
             return
-        if not transcript_stripped[-1] in '.!?':
-            # Allow sentences without punctuation if they're long enough (15+ words)
-            if len(words) < 15:
+        
+        # For unpunctuated sentences, be more lenient if they contain potential factual claims
+        last_char = transcript_stripped[-1]
+        if last_char not in '.!?':
+            # Check for factual indicators: numbers, proper nouns (capitals), location words
+            has_factual_indicators = any([
+                any(char.isdigit() for char in transcript),  # Contains numbers
+                sum(1 for word in words if word and word[0].isupper() and word not in ['I', 'And', 'But', 'So', 'Or']) >= 2,  # 2+ capitalized words (proper nouns)
+            ])
+            
+            # If has factual indicators, require only 8 words, otherwise need 15
+            min_words = 8 if has_factual_indicators else 15
+            if len(words) < min_words:
                 return
         
         self._last_checked_transcript = transcript
