@@ -66,6 +66,7 @@ from .generation import (
     update_instructions,
 )
 from .speech_handle import SpeechHandle
+from .intelligent_pause_detector import IntelligentPauseDetector, PauseAnalysis, InterruptionDecision
 
 if TYPE_CHECKING:
     from ..llm import mcp
@@ -127,6 +128,15 @@ class AgentActivity(RecognitionHooks):
         self._bypass_user_silence_wait: bool = False  # Set to True during forced interruption
         self._fact_check_task: asyncio.Task | None = None
         logger.info("[FACT-CHECK] Initialized real-time fact-checking system")
+        
+        # for intelligent pause detection and natural interruptions
+        self._pause_detector: IntelligentPauseDetector | None = None
+        self._pending_pause_analysis: asyncio.Task | None = None
+        self._last_speech_ended_at: float | None = None
+        self._pause_analysis_complete: asyncio.Event = asyncio.Event()
+        self._pause_analysis_complete.set()  # Initially not blocking
+        self._last_pause_was_complete: bool = True  # Assume complete until proven otherwise
+        logger.info("[PAUSE-DETECT] Intelligent pause detection system ready")
 
         # fired when a speech_task finishes or when a new speech_handle is scheduled
         # this is used to wake up the main task when the scheduling state changes
@@ -1212,6 +1222,13 @@ class AgentActivity(RecognitionHooks):
 
                 self._current_speech.interrupt()
     
+    def _ensure_pause_detector(self) -> IntelligentPauseDetector:
+        """Lazily initialize pause detector with LLM."""
+        if self._pause_detector is None:
+            self._pause_detector = IntelligentPauseDetector(self.llm)
+            logger.info("[PAUSE-DETECT] Initialized with LLM model")
+        return self._pause_detector
+    
     async def _check_for_factual_errors(self, transcript: str) -> None:
         """Check transcript for factual errors using OpenAI with conversation context."""
         # Don't interrupt while agent is speaking
@@ -1316,6 +1333,108 @@ class AgentActivity(RecognitionHooks):
         except Exception as e:
             logger.error(f"[FACT-CHECK] Error during fact-checking: {e}", exc_info=True)
     
+    async def _analyze_pause_and_unblock(self) -> None:
+        """Analyze pause and unblock turn completion based on result."""
+        try:
+            # Get current transcript and context
+            if not self._audio_recognition:
+                self._last_pause_was_complete = True
+                self._pause_analysis_complete.set()
+                return
+            
+            current_utterance = self._audio_recognition.current_transcript
+            interim_text = self._audio_recognition._audio_interim_transcript if hasattr(self._audio_recognition, '_audio_interim_transcript') else ""
+            
+            if not current_utterance.strip():
+                self._last_pause_was_complete = True
+                self._pause_analysis_complete.set()
+                return
+            
+            # Skip if this is just filler sounds (very short utterances)
+            words = current_utterance.strip().split()
+            if len(words) < 2:
+                logger.debug(f"[PAUSE-DETECT] Skipping - too short: '{current_utterance}'")
+                self._last_pause_was_complete = False  # Definitely not complete
+                self._pause_analysis_complete.set()
+                return
+            
+            detector = self._ensure_pause_detector()
+            
+            logger.info(f"[PAUSE-DETECT] Analyzing pause after: '{current_utterance[:100]}...'")
+            
+            # Analyze if the pause indicates completion
+            pause_analysis = await detector.analyze_pause(
+                current_utterance=current_utterance,
+                partial_transcript=interim_text,
+                recent_transcripts=self._user_transcript_buffer[-5:],
+            )
+            
+            logger.info(
+                f"[PAUSE-DETECT] Pause analysis: complete={pause_analysis.is_complete_thought}, "
+                f"confidence={pause_analysis.confidence:.2f}, reason='{pause_analysis.reason}'"
+            )
+            
+            # Store result and unblock turn completion
+            self._last_pause_was_complete = pause_analysis.is_complete_thought
+            
+            # If user hasn't completed their thought, BLOCK turn completion
+            if not pause_analysis.is_complete_thought:
+                logger.info(f"[PAUSE-DETECT] ⏸️  BLOCKING turn - user mid-thought (waiting for continuation)")
+                self._pause_analysis_complete.set()  # Unblock the check
+                return
+            
+            # User completed thought - allow turn completion
+            logger.info(f"[PAUSE-DETECT] ✅ Turn complete - allowing response")
+            self._pause_analysis_complete.set()  # Unblock turn completion
+            
+            # Check if AI has something valuable to add (for proactive responses)
+            agent_instructions = self._agent.instructions if hasattr(self._agent, 'instructions') else "helpful assistant"
+            
+            interruption_decision = await detector.should_agent_interrupt(
+                pause_analysis=pause_analysis,
+                conversation_context=self._user_transcript_buffer[-5:],
+                agent_instructions=agent_instructions,
+            )
+            
+            logger.info(
+                f"[PAUSE-DETECT] Interruption decision: should_interrupt={interruption_decision.should_interrupt}, "
+                f"priority={interruption_decision.priority:.2f}, reason='{interruption_decision.reason}'"
+            )
+            
+        except asyncio.CancelledError:
+            logger.debug("[PAUSE-DETECT] Pause analysis cancelled")
+            self._last_pause_was_complete = True  # Default to allowing turn
+            self._pause_analysis_complete.set()
+        except Exception as e:
+            logger.warning(f"[PAUSE-DETECT] Error during pause analysis: {e}", exc_info=True)
+            self._last_pause_was_complete = True  # Default to allowing turn on error
+            self._pause_analysis_complete.set()
+    
+    async def _natural_turn_taking_interrupt(self, decision: InterruptionDecision) -> None:
+        """Perform a natural turn-taking interruption (non-corrective)."""
+        try:
+            logger.info(f"[PAUSE-DETECT] Natural interrupt: {decision.reason}")
+            
+            # Wait for user silence naturally (not bypassing like fact-check does)
+            await self._user_silence_event.wait()
+            
+            # Check if conditions still valid (user hasn't started speaking again)
+            if not self._user_silence_event.is_set():
+                logger.debug("[PAUSE-DETECT] User resumed speaking, cancelling interrupt")
+                return
+            
+            # Generate reply naturally without special instructions
+            # The LLM will decide what to say based on context
+            handle = self._generate_reply(
+                allow_interruptions=True,  # Allow normal interruptions
+                schedule_speech=True,
+            )
+            
+            logger.info("[PAUSE-DETECT] Natural turn-taking speech scheduled")
+            
+        except Exception as e:
+            logger.error(f"[PAUSE-DETECT] Error in natural interruption: {e}", exc_info=True)
+    
     async def _force_agent_interruption(self, correction_message: str) -> None:
         """  
         Force the agent to interrupt the user with a factual correction.
@@ -1398,6 +1517,14 @@ class AgentActivity(RecognitionHooks):
             last_speaking_time=speech_end_time,
         )
         self._user_silence_event.set()
+        self._last_speech_ended_at = speech_end_time
+        
+        # BLOCK turn completion until pause analysis is done
+        if self._audio_recognition and isinstance(self.llm, llm.LLM) and self._turn_detection not in ("manual", "realtime_llm"):
+            self._pause_analysis_complete.clear()  # Block turn completion
+            self._pending_pause_analysis = asyncio.create_task(
+                self._analyze_pause_and_unblock()
+            )
 
         if (
             self._paused_speech
@@ -1583,6 +1710,18 @@ class AgentActivity(RecognitionHooks):
             # avoid interruption if the new_transcript is too short
             return False
 
+        # CRITICAL: Wait for pause analysis before completing turn
+        # This prevents responding to incomplete thoughts
+        if isinstance(self.llm, llm.LLM) and self._turn_detection not in ("manual", "realtime_llm"):
+            # Create task that waits for pause analysis
+            old_task = self._user_turn_completed_atask
+            self._user_turn_completed_atask = self._create_speech_task(
+                self._user_turn_completed_with_pause_check(old_task, info),
+                name="AgentActivity._user_turn_completed_task",
+            )
+            return True
+
+        # Default behavior for realtime_llm or manual mode
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
             self._user_turn_completed_task(old_task, info),
@@ -1590,6 +1729,31 @@ class AgentActivity(RecognitionHooks):
         )
         return True
 
+    @utils.log_exceptions(logger=logger)
+    async def _user_turn_completed_with_pause_check(
+        self, old_task: asyncio.Task[None] | None, info: _EndOfTurnInfo
+    ) -> None:
+        """Wait for pause analysis, then proceed with turn completion if appropriate."""
+        # Wait for pause analysis to complete (with timeout)
+        try:
+            await asyncio.wait_for(self._pause_analysis_complete.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning("[PAUSE-DETECT] Analysis timeout - defaulting to allow turn")
+            self._last_pause_was_complete = True
+        
+        # Check if the pause indicated an incomplete thought
+        if not self._last_pause_was_complete:
+            logger.info(
+                f"[PAUSE-DETECT] 🚫 Suppressing turn completion - incomplete thought detected",
+                extra={"transcript": info.new_transcript}
+            )
+            # Don't proceed with turn completion - user is mid-thought
+            return
+        
+        # Pause analysis says thought is complete - proceed normally
+        logger.debug("[PAUSE-DETECT] Proceeding with turn completion")
+        await self._user_turn_completed_task(old_task, info)
+    
     @utils.log_exceptions(logger=logger)
     async def _user_turn_completed_task(
         self, old_task: asyncio.Task[None] | None, info: _EndOfTurnInfo
