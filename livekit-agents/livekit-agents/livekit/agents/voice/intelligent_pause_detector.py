@@ -74,9 +74,9 @@ class IntelligentPauseDetector:
         recent_transcripts: list[str],
     ) -> PauseAnalysis:
         """
-        Analyze if a pause indicates a complete thought.
+        Analyze if a pause indicates a complete thought using LLM context understanding.
         
-        Uses speech patterns, context, and linguistic cues - NO timing thresholds.
+        100% context-aware with ZERO hard-coded patterns - relies entirely on LLM.
         
         Args:
             current_utterance: The text spoken before the pause
@@ -88,7 +88,7 @@ class IntelligentPauseDetector:
         if cache_key in self._pause_analysis_cache:
             return self._pause_analysis_cache[cache_key]
         
-        # Quick heuristic checks (linguistic patterns) - HUMAN-LIKE
+        # Only skip completely empty utterances
         if not current_utterance.strip():
             return PauseAnalysis(
                 is_complete_thought=False,
@@ -96,145 +96,33 @@ class IntelligentPauseDetector:
                 reason="Empty utterance - just noise/silence"
             )
         
-        utterance_lower = current_utterance.lower().strip()
-        words = utterance_lower.split()
-        
-        # Too short - definitely incomplete
-        if len(words) < 3:
+        # Use LLM for ALL analysis - no hard-coded patterns
+        try:
+            analysis = await self._llm_analyze_completion(
+                current_utterance=current_utterance,
+                partial_transcript=partial_transcript,
+                recent_transcripts=recent_transcripts,
+            )
+            
+            # Cache the result
+            self._pause_analysis_cache[cache_key] = analysis
+            
+            # Limit cache size
+            if len(self._pause_analysis_cache) > 50:
+                keys = list(self._pause_analysis_cache.keys())
+                for key in keys[:25]:
+                    del self._pause_analysis_cache[key]
+            
+            return analysis
+            
+        except Exception as e:
+            logger.warning(f"[PAUSE-DETECT] LLM analysis failed: {e}")
+            # Conservative fallback - assume incomplete to avoid premature interruption
             return PauseAnalysis(
                 is_complete_thought=False,
-                confidence=0.95,
-                reason="Too short to be complete"
+                confidence=0.3,
+                reason="Analysis failed - defaulting to incomplete to avoid premature interrupt"
             )
-        
-        # Check for obvious filler patterns at the END
-        filler_words = ["uh", "um", "er", "ah", "hmm", "like", "you know", "so", "well"]
-        last_word = words[-1] if words else ""
-        last_two = " ".join(words[-2:]) if len(words) >= 2 else ""
-        
-        if last_word in filler_words or last_two in filler_words:
-            return PauseAnalysis(
-                is_complete_thought=False,
-                confidence=0.95,
-                reason=f"Ends with filler '{last_word}' - clearly continuing"
-            )
-        
-        # Check for strong incomplete patterns ANYWHERE in the utterance
-        strong_incomplete = [
-            "i was wondering",
-            "the thing is",
-            "what i mean is", 
-            "let me think",
-            "so like",
-            "you know what",
-            "i'm trying to",
-            "i want to",
-            "i need to",
-            "i'd like to",
-            "i was thinking",
-            "i was going to",
-        ]
-        
-        for pattern in strong_incomplete:
-            if pattern in utterance_lower:
-                return PauseAnalysis(
-                    is_complete_thought=False,
-                    confidence=0.90,
-                    reason=f"Contains incomplete pattern: '{pattern}'"
-                )
-        
-        # Check if ends with obvious incomplete grammar
-        incomplete_endings = [
-            "and", "or", "but", "so", "if", "when", "where", "how", "why",
-            "that", "which", "who", "because", "since", "while", "although",
-            "to", "for", "with", "about", "like", "as"
-        ]
-        
-        if last_word in incomplete_endings:
-            return PauseAnalysis(
-                is_complete_thought=False,
-                confidence=0.85,
-                reason=f"Ends with conjunction/preposition '{last_word}'"
-            )
-        
-        # Check for question words without question mark - likely continuing
-        question_starts = ["what", "where", "when", "why", "how", "who", "which"]
-        first_word = words[0] if words else ""
-        if first_word in question_starts and not current_utterance.endswith("?"):
-            # Could be incomplete question
-            if len(words) < 5:
-                return PauseAnalysis(
-                    is_complete_thought=False,
-                    confidence=0.80,
-                    reason=f"Short question starting with '{first_word}' without ending"
-                )
-        
-        # If we have sentence-ending punctuation, likely complete
-        if current_utterance.endswith((".", "!", "?")):
-            return PauseAnalysis(
-                is_complete_thought=True,
-                confidence=0.85,
-                reason="Ends with sentence-ending punctuation"
-            )
-        
-        # For longer utterances without obvious incompleteness, do quick LLM check
-        # But only if it's worth it (mid-length, unclear)
-        if len(words) >= 5 and len(words) <= 20:
-            try:
-                analysis = await self._quick_llm_check(current_utterance, recent_transcripts)
-                self._pause_analysis_cache[cache_key] = analysis
-                
-                # Limit cache size
-                if len(self._pause_analysis_cache) > 50:
-                    keys = list(self._pause_analysis_cache.keys())
-                    for key in keys[:25]:
-                        del self._pause_analysis_cache[key]
-                
-                return analysis
-            except Exception:
-                # Fallback if LLM fails
-                pass
-        
-        # Default: if no clear signals, assume complete (safer for conversation)
-        return PauseAnalysis(
-            is_complete_thought=True,
-            confidence=0.60,
-            reason="No clear incomplete signals - allowing response"
-        )
-    
-    async def _quick_llm_check(
-        self,
-        current_utterance: str,
-        recent_transcripts: list[str],
-    ) -> PauseAnalysis:
-        """Quick LLM check for ambiguous cases."""
-        from .. import llm as llm_module
-        
-        context = " | ".join(recent_transcripts[-2:]) if recent_transcripts else ""
-        
-        prompt = (
-            f"Is this a complete thought or mid-sentence?\n\n"
-            f"Context: {context}\n"
-            f"Utterance: \"{current_utterance}\"\n\n"
-            f"Answer ONLY: COMPLETE or INCOMPLETE"
-        )
-        
-        chat_ctx = llm_module.ChatContext()
-        chat_ctx.add_message(role="system", content="You analyze speech completion. Reply only COMPLETE or INCOMPLETE.")
-        chat_ctx.add_message(role="user", content=prompt)
-        
-        response_text = ""
-        async for chunk in self._llm.chat(chat_ctx=chat_ctx):
-            if chunk.delta and chunk.delta.content:
-                response_text += chunk.delta.content
-        
-        is_complete = "complete" in response_text.lower() and "incomplete" not in response_text.lower()
-        
-        return PauseAnalysis(
-            is_complete_thought=is_complete,
-            confidence=0.75,
-            reason=f"LLM quick check: {response_text.strip()}"
-        )
     
     async def _llm_analyze_completion(
         self,
@@ -243,33 +131,55 @@ class IntelligentPauseDetector:
         partial_transcript: str,
         recent_transcripts: list[str],
     ) -> PauseAnalysis:
-        """Use LLM to analyze if the utterance represents a complete thought."""
+        """
+        Use LLM to analyze if the utterance represents a complete thought.
+        
+        Completely context-aware - understands nuances like:
+        - "I was wondering..." (mid-thought, continuing)
+        - "I was wondering about that." (complete)
+        - Natural speech patterns and intentionality
+        """
         from .. import llm as llm_module
         
-        # Build context
-        context = "\n".join(recent_transcripts[-3:]) if recent_transcripts else ""
+        # Build rich conversational context
+        context = "\n".join(recent_transcripts[-5:]) if recent_transcripts else ""
         
         prompt = (
-            f"Analyze if this spoken utterance represents a COMPLETE thought or if the speaker is mid-sentence:\n\n"
-            f"Recent context: {context}\n\n"
-            f"Current utterance: \"{current_utterance}\"\n"
-            f"Partial/interim: \"{partial_transcript}\"\n\n"
-            f"TASK: Determine if the speaker finished their thought or is pausing mid-idea.\n"
-            f"Consider:\n"
-            f"1. Sentence structure and grammatical completeness\n"
-            f"2. Semantic completeness (did they finish the point?)\n"
-            f"3. Whether it's a natural pause or hesitation (um, uh, I mean, etc.)\n"
-            f"4. Context from previous utterances\n\n"
+            f"You are analyzing real-time voice conversation to detect thought completion.\n\n"
+            f"RECENT CONVERSATION:\n{context}\n\n"
+            f"CURRENT UTTERANCE: \"{current_utterance}\"\n"
+            f"PARTIAL/INTERIM TEXT: \"{partial_transcript}\"\n\n"
+            f"TASK: Determine if the speaker has FINISHED their current thought/idea or is mid-sentence.\n\n"
+            f"KEY CONSIDERATIONS:\n"
+            f"1. CONTEXT & INTENT: Is this utterance complete in the flow of conversation?\n"
+            f"   - \"I was wondering...\" [PAUSE] = INCOMPLETE (clearly continuing)\n"
+            f"   - \"I was wondering about your offer.\" = COMPLETE\n"
+            f"   - \"So the thing is...\" [PAUSE] = INCOMPLETE\n"
+            f"   - \"The thing is, I agree.\" = COMPLETE\n\n"
+            f"2. SPEECH PATTERNS: Natural pauses vs intentional stops\n"
+            f"   - Hesitation patterns (um, uh, like) suggest continuation\n"
+            f"   - Trailing conjunctions (and, but, so) suggest more coming\n"
+            f"   - Complete grammatical structure suggests finished\n\n"
+            f"3. SEMANTIC WHOLENESS: Did they express a complete idea?\n"
+            f"   - Partial questions/statements = INCOMPLETE\n"
+            f"   - Answered questions/complete statements = COMPLETE\n\n"
+            f"4. CONVERSATIONAL CONTEXT: What makes sense in this dialogue?\n"
+            f"   - Building on previous point = may be incomplete\n"
+            f"   - Responding to question = likely complete\n\n"
             f"Respond in this EXACT format:\n"
             f"COMPLETE: [yes/no]\n"
             f"CONFIDENCE: [0.0-1.0]\n"
-            f"REASON: [brief explanation]"
+            f"REASON: [specific explanation based on content and context]"
         )
         
         chat_ctx = llm_module.ChatContext()
         chat_ctx.add_message(
             role="system",
-            content="You are an expert in speech analysis and natural language understanding. Analyze utterances to detect thought completion."
+            content=(
+                "You are an expert in natural speech analysis with deep understanding of "
+                "conversational context, intent, and human communication patterns. "
+                "You analyze MEANING and CONTEXT, not just grammar patterns."
+            )
         )
         chat_ctx.add_message(role="user", content=prompt)
         
@@ -305,34 +215,6 @@ class IntelligentPauseDetector:
             is_complete_thought=is_complete,
             confidence=confidence,
             reason=reason
-        )
-    
-    def _basic_completion_check(self, utterance: str) -> PauseAnalysis:
-        """Fallback basic completion check without LLM."""
-        utterance = utterance.strip()
-        
-        # Check sentence-ending punctuation
-        if utterance and utterance[-1] in ".!?":
-            return PauseAnalysis(
-                is_complete_thought=True,
-                confidence=0.7,
-                reason="Ends with sentence-ending punctuation"
-            )
-        
-        # Check word count (short utterances unlikely to be complete)
-        words = utterance.split()
-        if len(words) < 3:
-            return PauseAnalysis(
-                is_complete_thought=False,
-                confidence=0.6,
-                reason="Too short to be complete thought"
-            )
-        
-        # Default to incomplete (safer for natural conversation)
-        return PauseAnalysis(
-            is_complete_thought=False,
-            confidence=0.5,
-            reason="Unclear - defaulting to incomplete"
         )
     
     async def should_agent_interrupt(
@@ -394,37 +276,73 @@ class IntelligentPauseDetector:
         conversation_context: list[str],
         agent_instructions: str,
     ) -> InterruptionDecision:
-        """Use LLM to determine if the agent has something valuable to add."""
+        """
+        Use LLM to determine if the agent has something valuable to add.
+        
+        Completely context-aware decision making - understands:
+        - Conversational flow and natural turn-taking
+        - Emotional/personal moments where listening is better
+        - Questions vs statements vs thinking out loud
+        - Whether interrupting would be helpful or disruptive
+        """
         from .. import llm as llm_module
         
-        context_text = "\n".join(conversation_context[-5:])
+        context_text = "\n".join(conversation_context[-7:])  # More context for better decisions
         
         prompt = (
-            f"You are deciding if an AI assistant should speak right now.\n\n"
-            f"AGENT ROLE: {agent_instructions}\n\n"
-            f"CONVERSATION:\n{context_text}\n\n"
-            f"SITUATION: User just finished speaking ({pause_analysis.reason})\n\n"
-            f"QUESTION: Does the agent have something VALUABLE to add RIGHT NOW?\n\n"
-            f"Consider:\n"
-            f"1. Does the user need/expect a response?\n"
-            f"2. Is this a natural turn-taking moment?\n"
-            f"3. Would speaking now add value vs letting user continue?\n"
-            f"4. Is user sharing personal/emotional content (don't interrupt)?\n"
-            f"5. Is user asking a question or making a statement that needs response?\n\n"
-            f"DO NOT INTERRUPT if:\n"
-            f"- User is sharing personal stories/emotions\n"
-            f"- User is thinking out loud\n"
-            f"- User might have more to say\n\n"
-            f"Respond in EXACT format:\n"
+            f"You are analyzing a real-time voice conversation to decide if the AI should speak now.\n\n"
+            f"AGENT ROLE & CAPABILITIES:\n{agent_instructions}\n\n"
+            f"CONVERSATION HISTORY:\n{context_text}\n\n"
+            f"PAUSE ANALYSIS: {pause_analysis.reason} (confidence: {pause_analysis.confidence:.2f})\n\n"
+            f"DECISION TASK: Should the agent interrupt to speak RIGHT NOW?\n\n"
+            f"CRITICAL EVALUATION CRITERIA:\n\n"
+            f"1. CONVERSATIONAL CONTEXT & INTENT:\n"
+            f"   - Is the user expecting a response right now?\n"
+            f"   - Did they ask a direct question?\n"
+            f"   - Are they making a statement that requires acknowledgment?\n"
+            f"   - Or are they just thinking out loud/processing?\n\n"
+            f"2. EMOTIONAL & PERSONAL CONTENT:\n"
+            f"   - Is the user sharing something personal or emotional?\n"
+            f"   - Are they in the middle of explaining feelings/experiences?\n"
+            f"   - Would interrupting feel disrespectful or break their flow?\n\n"
+            f"3. NATURAL TURN-TAKING:\n"
+            f"   - Is this a natural conversational pause/turn boundary?\n"
+            f"   - Or might the user have more to add in a moment?\n"
+            f"   - Does the conversation flow suggest it's the agent's turn?\n\n"
+            f"4. VALUE ASSESSMENT:\n"
+            f"   - Does the agent have something VALUABLE/HELPFUL to add?\n"
+            f"   - Would it improve the conversation to speak now?\n"
+            f"   - Or is silence/waiting more appropriate?\n\n"
+            f"5. CONTEXT AWARENESS:\n"
+            f"   - Consider the full conversation arc\n"
+            f"   - Understand user's communication style\n"
+            f"   - Respect the natural rhythm of this specific dialogue\n\n"
+            f"WHEN TO INTERRUPT (speak now):\n"
+            f"✓ Direct questions requiring answers\n"
+            f"✓ User explicitly seeking input/help\n"
+            f"✓ Natural turn-taking boundary with something to contribute\n"
+            f"✓ Clarification needed to prevent misunderstanding\n\n"
+            f"WHEN NOT TO INTERRUPT (stay silent):\n"
+            f"✗ Personal stories or emotional sharing in progress\n"
+            f"✗ User thinking out loud or processing\n"
+            f"✗ Mid-explanation or building to a point\n"
+            f"✗ Might have more to say after brief pause\n"
+            f"✗ Silence would be more respectful/valuable\n\n"
+            f"Respond in this EXACT format:\n"
             f"INTERRUPT: [yes/no]\n"
-            f"PRIORITY: [0.0-1.0]\n"
-            f"REASON: [brief explanation]"
+            f"PRIORITY: [0.0-1.0 where 1.0 = urgent/important, 0.0 = unnecessary]\n"
+            f"REASON: [detailed context-based explanation of your decision]"
         )
         
         chat_ctx = llm_module.ChatContext()
         chat_ctx.add_message(
             role="system",
-            content="You are an expert in conversation dynamics and know when to speak and when to listen."
+            content=(
+                "You are a world-class expert in conversation dynamics, human communication, "
+                "and social intelligence. You understand nuance, context, emotional undertones, "
+                "and the delicate art of knowing when to speak and when to listen. "
+                "You make decisions based on DEEP CONTEXTUAL UNDERSTANDING, not rules or patterns."
+            )
         )
         chat_ctx.add_message(role="user", content=prompt)
         
