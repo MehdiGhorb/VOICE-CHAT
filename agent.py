@@ -1,5 +1,10 @@
+import sys
+import os
+
+# Add livekit-agents to path to use emotion-aware agent
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'livekit-agents', 'livekit-agents'))
+
 from livekit.agents import (
-    Agent,
     AgentSession,
     JobContext,
     RunContext,
@@ -7,6 +12,7 @@ from livekit.agents import (
     cli,
     function_tool,
 )
+from livekit.agents.voice.emotion_aware_agent import EmotionAwareAgent
 from livekit.plugins import silero, deepgram, openai, cartesia
 from dotenv import load_dotenv
 load_dotenv('.env.local')
@@ -17,29 +23,41 @@ async def lookup_weather(
     location: str,
 ):
     """Used to look up weather information."""
-
     return {"weather": "sunny", "temperature": 70}
 
 
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
-    agent = Agent(
-        instructions="You are a friendly voice assistant built by LiveKit.",
+    # Create emotion-aware agent with enhanced instructions
+    agent = EmotionAwareAgent(
+        instructions=(
+            "You are a friendly and expressive voice assistant built by LiveKit. "
+            "You adapt your emotional tone naturally based on the conversation context. "
+            "Be warm and engaging, matching your intonation to the situation - "
+            "excited for good news, sympathetic for concerns, enthusiastic when helping, "
+            "and calm when providing information."
+        ),
         tools=[lookup_weather],
+        stt=deepgram.STT(),
+        llm=openai.LLM(model="gpt-4o-mini"),
+        tts=cartesia.TTS(
+            # Use an emotive voice for best emotion control
+            # Leo, Jace, Kyle, Gavin are recommended male voices
+            # Maya, Tessa, Dana, Marian are recommended female voices
+            voice="cbaf8084-f009-4838-a096-07ee2e6612b1",  # Maya - Emotive female voice
+            model="sonic-3",  # sonic-3 has best emotion support
+        ),
     )
     
     # Use your own API keys directly (not LiveKit's managed services)
     # VAD is required for the interruption system to work
-    session = AgentSession( 
+    session = AgentSession(
         vad=silero.VAD.load(),  # Required for interruption detection
-        stt=deepgram.STT(),  # Uses DEEPGRAM_API_KEY from .env.local
-        llm=openai.LLM(model="gpt-4o-mini"),  # Uses OPENAI_API_KEY from .env.local
-        tts=cartesia.TTS(voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),  # Uses CARTESIA_API_KEY from .env.local
     )
 
     await session.start(agent=agent, room=ctx.room)
-    await session.generate_reply(instructions="greet the user and ask about their day")
+    await session.generate_reply(instructions="greet the user warmly and ask about their day")
 
 
 if __name__ == "__main__":
