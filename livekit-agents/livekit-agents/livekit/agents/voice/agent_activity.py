@@ -1239,9 +1239,9 @@ class AgentActivity(RecognitionHooks):
         if transcript == self._last_checked_transcript:
             return
         
-        # Better filtering: need at least 7 words
+        # Better filtering: need at least 5 words (reduced from 7 for faster detection)
         words = transcript.split()
-        if len(words) < 7:
+        if len(words) < 5:
             return
         
         # Skip if doesn't end with sentence-ending punctuation (incomplete thought)
@@ -1275,13 +1275,13 @@ class AgentActivity(RecognitionHooks):
         if transcript not in full_context:
             full_context = full_context + " " + transcript
         
-        # Keep context short and recent (max ~100 words)
+        # Keep context short and recent (max ~150 words for better continuity)
         context_words = full_context.split()
-        if len(context_words) > 100:
-            full_context = " ".join(context_words[-100:])
+        if len(context_words) > 150:
+            full_context = " ".join(context_words[-250:])
         
         prompt = (
-            f"Analyze this statement for factual errors:\\n\\n"
+            f"Analyze this statement for factual errors (the latest message is important but try to understand the context):\\n\\n"
             f"STATEMENT: \\\"{transcript}\\\"\\n\\n"
             f"RULES:\\n"
             f"1. ONLY flag CLEAR, VERIFIABLE factual errors (wrong math, wrong geography, wrong science, wrong historical facts)\\n"
@@ -1321,9 +1321,8 @@ class AgentActivity(RecognitionHooks):
                 logger.warning(f"[FACT-CHECK] Wrong statement: {transcript}")
                 logger.warning(f"[FACT-CHECK] Correction: {correction}")
                 
-                # Clear conversation buffer to avoid re-flagging this same error
-                self._user_transcript_buffer.clear()
-                logger.info("[FACT-CHECK] Cleared conversation buffer after correction")
+                # Don't clear buffer - maintain context for follow-up conversation
+                logger.info("[FACT-CHECK] Maintaining conversation buffer for context continuity")
                 
                 # Trigger interruption with the correction
                 await self._force_agent_interruption(correction)
@@ -1360,13 +1359,14 @@ class AgentActivity(RecognitionHooks):
             
             detector = self._ensure_pause_detector()
             
-            logger.info(f"[PAUSE-DETECT] Analyzing pause after: '{current_utterance[:100]}...'")
+            # Log truncated version but analyze FULL transcript
+            logger.info(f"[PAUSE-DETECT] Analyzing pause after: '{current_utterance[:100]}{'...' if len(current_utterance) > 100 else ''}'")
             
-            # Analyze if the pause indicates completion
+            # CRITICAL: Analyze FULL transcript, not truncated version
             pause_analysis = await detector.analyze_pause(
-                current_utterance=current_utterance,
+                current_utterance=current_utterance,  # Full text, not truncated!
                 partial_transcript=interim_text,
-                recent_transcripts=self._user_transcript_buffer[-5:],
+                recent_transcripts=self._user_transcript_buffer[-7:],  # More context
             )
             
             logger.info(
@@ -1377,11 +1377,15 @@ class AgentActivity(RecognitionHooks):
             # Store result and unblock turn completion
             self._last_pause_was_complete = pause_analysis.is_complete_thought
             
-            # If user hasn't completed their thought, BLOCK turn completion
-            if not pause_analysis.is_complete_thought:
-                logger.info(f"[PAUSE-DETECT] ⏸️  BLOCKING turn - user mid-thought (waiting for continuation)")
+            # If user hasn't completed their thought AND confidence is high, BLOCK turn completion
+            # Lower blocking threshold to reduce false blocks
+            if not pause_analysis.is_complete_thought and pause_analysis.confidence >= 0.85:
+                logger.info(f"[PAUSE-DETECT] ⏸️  BLOCKING turn - user mid-thought (conf={pause_analysis.confidence:.2f})")
                 self._pause_analysis_complete.set()  # Unblock the check
                 return
+            elif not pause_analysis.is_complete_thought:
+                logger.info(f"[PAUSE-DETECT] ⚠️  Low confidence block ({pause_analysis.confidence:.2f}) - allowing turn")
+                self._last_pause_was_complete = True  # Override for low confidence
             
             # User completed thought - allow turn completion
             logger.info(f"[PAUSE-DETECT] ✅ Turn complete - allowing response")
