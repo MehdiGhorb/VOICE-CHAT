@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import heapq
 import json
+import openai
 import time
 from collections.abc import AsyncIterable, Coroutine, Sequence
 from dataclasses import dataclass
@@ -1264,9 +1265,6 @@ class AgentActivity(RecognitionHooks):
                 return
         
         self._last_checked_transcript = transcript
-        
-        # Use OpenAI to check for factual errors
-        import openai
         
         client = openai.AsyncOpenAI()  # Uses OPENAI_API_KEY from environment
         

@@ -32,11 +32,11 @@ async def entrypoint(ctx: JobContext):
     # Create emotion-aware agent with enhanced instructions
     agent = EmotionAwareAgent(
         instructions=(
-            "You are a friendly and expressive voice assistant built by LiveKit. "
-            "You adapt your emotional tone naturally based on the conversation context. "
-            "Be warm and engaging, matching your intonation to the situation - "
-            "excited for good news, sympathetic for concerns, enthusiastic when helping, "
-            "and calm when providing information."
+            "You are a professional and helpful voice assistant built by LiveKit. "
+            "You communicate naturally and clearly. "
+            "You adapt your emotional tone based on the conversation context, "
+            "but maintain a generally neutral and professional demeanor. "
+            "Reserve emotional intonation for situations that genuinely warrant it."
         ),
         tools=[lookup_weather],
         stt=deepgram.STT(),
@@ -57,7 +57,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     await session.start(agent=agent, room=ctx.room)
-    await session.generate_reply(instructions="greet the user warmly and ask about their day")
+    await session.generate_reply(instructions="greet the user naturally and ask about their day")
 
 
 if __name__ == "__main__":
