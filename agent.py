@@ -29,6 +29,19 @@ async def lookup_weather(
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
+    # Get configuration from room metadata
+    room_metadata = ctx.room.metadata or "{}"
+    import json
+    try:
+        config = json.loads(room_metadata)
+    except:
+        config = {}
+    
+    # Extract settings with defaults
+    voice_id = config.get("voice", "cbaf8084-f009-4838-a096-07ee2e6612b1")  # Default: Anna
+    model_name = config.get("model", "gpt-4o-mini")
+    min_endpointing_delay = config.get("min_endpointing_delay", 0.5)
+    
     # Create emotion-aware agent with enhanced instructions
     agent = EmotionAwareAgent(
         instructions=(
@@ -40,14 +53,12 @@ async def entrypoint(ctx: JobContext):
         ),
         tools=[lookup_weather],
         stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o-mini"),
+        llm=openai.LLM(model=model_name),
         tts=cartesia.TTS(
-            # Use an emotive voice for best emotion control
-            # Leo, Jace, Kyle, Gavin are recommended male voices
-            # Maya, Tessa, Dana, Marian are recommended female voices
-            voice="cbaf8084-f009-4838-a096-07ee2e6612b1",  # Maya - Emotive female voice
-            model="sonic-3",  # sonic-3 has best emotion support
+            voice=voice_id,
+            model="sonic-3",
         ),
+        min_endpointing_delay=min_endpointing_delay,
     )
     
     # Use your own API keys directly (not LiveKit's managed services)
