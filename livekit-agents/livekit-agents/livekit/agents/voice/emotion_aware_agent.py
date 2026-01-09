@@ -163,59 +163,42 @@ Remember: Your emotion choice will be expressed through voice tone automatically
         """
         Override TTS node to apply emotion-based intonation dynamically.
         
-        This method:
-        1. Extracts emotion metadata from LLM output
-        2. Updates TTS with appropriate emotion setting
-        3. Adds [laughter] when contextually appropriate
+        Optimized for low latency:
+        1. Extracts emotion metadata from LLM output without blocking text flow
+        2. Updates TTS emotion as soon as detected (doesn't wait for complete response)
+        3. Streams text to TTS immediately while processing emotion in parallel
         4. Yields only the actual text content for synthesis
         """
         emotion_updated = False
-        accumulated_text = ""
         
         def on_emotion_detected(resp: EmotionResponse) -> None:
-            """Callback invoked when emotion metadata is parsed."""
-            nonlocal emotion_updated, accumulated_text
+            """Callback invoked when emotion metadata is parsed. Called only once."""
+            nonlocal emotion_updated
             
-            if resp.get("emotion") and not emotion_updated:
-                emotion = validate_emotion(resp["emotion"])
-                self._current_emotion = emotion
-                emotion_updated = True
-                
-                # Update TTS with detected emotion
-                if isinstance(self.tts, cartesia.TTS):
-                    logger.info(
-                        f"Applying emotion '{emotion}' to TTS synthesis"
-                    )
-                    self.tts.update_options(emotion=emotion)
-                else:
-                    logger.warning(
-                        f"TTS provider {type(self.tts).__name__} may not support emotion control"
-                    )
+            # Only process emotion once (optimization)
+            if emotion_updated or not resp.get("emotion"):
+                return
             
-            # Track accumulated text for laughter detection
-            if resp.get("text"):
-                accumulated_text = resp["text"]
-        
-        async def process_text_with_emotion() -> AsyncIterable[str]:
-            """Process text stream to extract emotion and add laughter if appropriate."""
-            nonlocal accumulated_text
+            emotion = validate_emotion(resp["emotion"])
+            self._current_emotion = emotion
+            emotion_updated = True
             
-            async for text_chunk in process_emotion_response(text, callback=on_emotion_detected):
-                yield text_chunk
-                accumulated_text += text_chunk
-            
-            # After all text is processed, check if we should add laughter
-            if accumulated_text and emotion_updated:
-                if should_add_laughter(accumulated_text, self._current_emotion):
-                    logger.debug(f"Adding [laughter] for emotion '{self._current_emotion}'")
-                    # Note: [laughter] should be added inline where appropriate,
-                    # not at the end. This is a simplified implementation.
-                    # For production, you might want to parse and inject it contextually.
+            # Update TTS with detected emotion - this happens ASAP
+            if isinstance(self.tts, cartesia.TTS):
+                logger.info(
+                    f"Applying emotion '{emotion}' to TTS synthesis"
+                )
+                self.tts.update_options(emotion=emotion)
+            else:
+                logger.warning(
+                    f"TTS provider {type(self.tts).__name__} may not support emotion control"
+                )
         
         # Use the default TTS node with our emotion-processed text
+        # The process_emotion_response now yields text immediately without waiting
         return Agent.default.tts_node(
             self,
-            process_text_with_emotion(),
+            process_emotion_response(text, callback=on_emotion_detected),
             model_settings
         )
     

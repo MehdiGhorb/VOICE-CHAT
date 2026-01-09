@@ -37,10 +37,12 @@ async def entrypoint(ctx: JobContext):
     except:
         config = {}
     
-    # Extract settings with defaults
+    # Extract settings with defaults - optimized for low latency
     voice_id = config.get("voice", "cbaf8084-f009-4838-a096-07ee2e6612b1")  # Default: Anna
     model_name = config.get("model", "gpt-4o-mini")
-    min_endpointing_delay = config.get("min_endpointing_delay", 0.5)
+    # Reduced default endpointing delay for faster response (0.3s vs 0.5s)
+    # Still allows interruption detection but with lower latency
+    min_endpointing_delay = config.get("min_endpointing_delay", 0.3)
     
     # Create emotion-aware agent with enhanced instructions
     agent = EmotionAwareAgent(

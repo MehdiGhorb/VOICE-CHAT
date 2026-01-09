@@ -76,6 +76,11 @@ async def process_emotion_response(
     Extracts emotion information from structured JSON response and yields
     only the actual text content for TTS synthesis.
     
+    Optimized for low latency:
+    - Starts yielding text as soon as possible
+    - Caches parsed responses to avoid redundant parsing
+    - Only fires callback once when emotion is detected
+    
     Args:
         text: Async iterable of text chunks from LLM
         callback: Optional callback invoked when emotion metadata is detected
@@ -85,26 +90,35 @@ async def process_emotion_response(
     """
     last_response = ""
     acc_text = ""
+    emotion_detected = False  # Track if we've already called callback
+    last_parsed_resp = None  # Cache last successful parse
     
     async for chunk in text:
         acc_text += chunk
+        
+        # Try to parse, but use cached result if parsing fails
         try:
             # Try parsing as JSON with partial support (streaming)
             resp: EmotionResponse = from_json(
                 acc_text, 
                 allow_partial="trailing-strings"
             )
+            last_parsed_resp = resp  # Cache successful parse
+            
+            # Only call callback once when emotion is first detected
+            if callback and not emotion_detected and resp.get("emotion"):
+                callback(resp)
+                emotion_detected = True
         except ValueError:
-            # Not yet valid JSON, continue accumulating
-            continue
-        
-        if callback:
-            callback(resp)
+            # Not yet valid JSON, use cached response if available
+            if last_parsed_resp is None:
+                continue
+            resp = last_parsed_resp
         
         if not resp.get("text"):
             continue
         
-        # Yield only new text delta
+        # Yield only new text delta - this enables streaming to TTS immediately
         new_delta = resp["text"][len(last_response):]
         if new_delta:
             yield new_delta
