@@ -70,7 +70,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     await session.start(agent=agent, room=ctx.room)
-    await session.generate_reply(instructions="greet the user naturally and ask about their day")
+    await session.generate_reply(instructions="greet the user by saying 'Hi Hi, How is it going?!' ")
 
 
 if __name__ == "__main__":
