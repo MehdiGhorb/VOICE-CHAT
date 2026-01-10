@@ -128,6 +128,7 @@ class AgentActivity(RecognitionHooks):
         self._is_agent_speaking: bool = False
         self._bypass_user_silence_wait: bool = False  # Set to True during forced interruption
         self._fact_check_task: asyncio.Task | None = None
+        self._corrected_errors: set[str] = set()  # Track normalized versions of already-corrected errors
         logger.info("[FACT-CHECK] Initialized real-time fact-checking system")
         
         # for intelligent pause detection and natural interruptions
@@ -1240,6 +1241,15 @@ class AgentActivity(RecognitionHooks):
         if transcript == self._last_checked_transcript:
             return
         
+        # Normalize transcript for deduplication (remove filler words, lowercase, etc.)
+        normalized = ' '.join(w.lower().strip('.,!?') for w in transcript.split() 
+                             if w.lower() not in ['um', 'uh', 'like', 'you', 'know', 'i', 'mean', 'ok', 'okay', 'sure', 'well', 'so'])
+        
+        # Skip if we already corrected this exact error recently
+        if normalized in self._corrected_errors:
+            logger.debug(f"[FACT-CHECK] Skipping already-corrected error: {transcript}")
+            return
+        
         # Better filtering: need at least 5 words (reduced from 7 for faster detection)
         words = transcript.split()
         if len(words) < 5:
@@ -1268,15 +1278,15 @@ class AgentActivity(RecognitionHooks):
         
         client = openai.AsyncOpenAI()  # Uses OPENAI_API_KEY from environment
         
-        # Build context from conversation buffer (last 3-5 messages only for recency)
-        full_context = " ".join(self._user_transcript_buffer[-5:])  # Last 5 messages only
+        # Build context from conversation buffer (last 3 messages only for better focus)
+        full_context = " ".join(self._user_transcript_buffer[-3:])  # Last 3 messages only
         if transcript not in full_context:
             full_context = full_context + " " + transcript
         
-        # Keep context short and recent (max ~150 words for better continuity)
+        # Keep context short and recent (max ~100 words for better accuracy)
         context_words = full_context.split()
-        if len(context_words) > 150:
-            full_context = " ".join(context_words[-250:])
+        if len(context_words) > 100:
+            full_context = " ".join(context_words[-100:])
         
         prompt = (
             f"Analyze this statement for factual errors (the latest message is important but try to understand the context):\\n\\n"
@@ -1319,11 +1329,20 @@ class AgentActivity(RecognitionHooks):
                 logger.warning(f"[FACT-CHECK] Wrong statement: {transcript}")
                 logger.warning(f"[FACT-CHECK] Correction: {correction}")
                 
+                # Track this error as corrected to avoid repeating
+                normalized = ' '.join(w.lower().strip('.,!?') for w in transcript.split() 
+                                     if w.lower() not in ['um', 'uh', 'like', 'you', 'know', 'i', 'mean', 'ok', 'okay', 'sure', 'well', 'so'])
+                self._corrected_errors.add(normalized)
+                
+                # Keep only last 20 corrected errors to avoid memory bloat
+                if len(self._corrected_errors) > 20:
+                    self._corrected_errors = set(list(self._corrected_errors)[-20:])
+                
                 # Don't clear buffer - maintain context for follow-up conversation
                 logger.info("[FACT-CHECK] Maintaining conversation buffer for context continuity")
                 
                 # Trigger interruption with the correction
-                await self._force_agent_interruption(correction)
+                await self._force_agent_interruption(transcript, correction)
                 
         except asyncio.CancelledError:
             logger.debug(f"[FACT-CHECK] Check cancelled for: {transcript}")
@@ -1437,11 +1456,12 @@ class AgentActivity(RecognitionHooks):
         except Exception as e:
             logger.error(f"[PAUSE-DETECT] Error in natural interruption: {e}", exc_info=True)
     
-    async def _force_agent_interruption(self, correction_message: str) -> None:
+    async def _force_agent_interruption(self, user_statement: str, correction_message: str) -> None:
         """  
         Force the agent to interrupt the user with a factual correction.
         
         Args:
+            user_statement: The user's incorrect statement
             correction_message: The correction message from the fact-checker
         """
         try:
@@ -1465,12 +1485,19 @@ class AgentActivity(RecognitionHooks):
             # CRITICAL: Force the user silence event to be set so speech can be scheduled
             self._user_silence_event.set()
             
+            # Add user's incorrect statement to chat context so LLM knows what to correct
+            user_message = llm.ChatMessage(
+                role="user",
+                content=[user_statement],
+            )
+            self._agent._chat_ctx.items.append(user_message)
+            
             # Use _generate_reply with clear, direct correction instruction
-            # Important: Keep it simple to avoid triggering unrelated tool calls
+            # Now the LLM can see what the user said and respond appropriately
             system_instruction = (
-                f"The user just made a factual error. "
-                f"Politely say: 'Actually, {correction_message}' "
-                f"Keep your response to exactly that - no tools, no extra information."
+                f"The user just made a factual error in their last message. "
+                f"Politely correct them by saying: 'Actually, {correction_message}' "
+                f"Keep your response brief and friendly - just correct the error, don't elaborate unless asked."
             )
             
             # Generate the reply with the correction (disable tools to prevent unrelated calls)
