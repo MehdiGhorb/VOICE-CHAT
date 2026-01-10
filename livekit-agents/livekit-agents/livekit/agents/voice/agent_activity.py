@@ -1250,9 +1250,9 @@ class AgentActivity(RecognitionHooks):
             logger.debug(f"[FACT-CHECK] Skipping already-corrected error: {transcript}")
             return
         
-        # Better filtering: need at least 5 words (reduced from 7 for faster detection)
+        # Lower threshold to 4 words to catch important short claims like "ChatGPT in 1980s"
         words = transcript.split()
-        if len(words) < 5:
+        if len(words) < 4:
             return
         
         # Skip if doesn't end with sentence-ending punctuation (incomplete thought)
@@ -1278,40 +1278,48 @@ class AgentActivity(RecognitionHooks):
         
         client = openai.AsyncOpenAI()  # Uses OPENAI_API_KEY from environment
         
-        # Build context from conversation buffer (last 3 messages only for better focus)
-        full_context = " ".join(self._user_transcript_buffer[-3:])  # Last 3 messages only
+        # Build RICHER context - last 5 messages to capture temporal/historical context
+        # This is critical for catching errors like "ChatGPT in 1980s" where date is in earlier segment
+        full_context = " ".join(self._user_transcript_buffer[-5:])  # Last 5 messages
         if transcript not in full_context:
             full_context = full_context + " " + transcript
         
-        # Keep context short and recent (max ~100 words for better accuracy)
+        # Keep context manageable but sufficient for temporal claims (max ~200 words)
         context_words = full_context.split()
-        if len(context_words) > 100:
-            full_context = " ".join(context_words[-100:])
+        if len(context_words) > 200:
+            full_context = " ".join(context_words[-200:])
         
         prompt = (
-            f"Analyze this statement for factual errors (the latest message is important but try to understand the context):\\n\\n"
-            f"STATEMENT: \\\"{transcript}\\\"\\n\\n"
-            f"RULES:\\n"
-            f"1. ONLY flag CLEAR, VERIFIABLE factual errors (wrong math, wrong geography, wrong science, wrong historical facts)\\n"
-            f"2. Ignore opinions, incomplete sentences, grammar issues, or statements without specific factual claims\\n"
-            f"3. If there is a factual error, respond: INCORRECT: [1-2 sentence correction]\\n"
-            f"4. Otherwise respond: CORRECT\\n\\n"
+            f"Analyze this statement for factual errors using the FULL CONTEXT provided:\\n\\n"
+            f"FULL CONTEXT: \\\"{full_context}\\\"\\n\\n"
+            f"LATEST STATEMENT TO CHECK: \\\"{transcript}\\\"\\n\\n"
+            f"CRITICAL RULES:\\n"
+            f"1. ONLY flag CLEAR, VERIFIABLE factual errors (wrong math, geography, science, historical facts, DATES/TIME PERIODS)\\n"
+            f"2. **Pay special attention to TEMPORAL CLAIMS**: Check if events/technologies are placed in correct time periods\\n"
+            f"3. Use the FULL CONTEXT to identify dates, time periods, and historical references\\n"
+            f"4. Ignore opinions, incomplete sentences, grammar issues, or vague statements\\n"
+            f"5. If there is a factual error, respond: INCORRECT: [1-2 sentence correction]\\n"
+            f"6. Otherwise respond: CORRECT\\n\\n"
             f"EXAMPLES:\\n"
             f"- 'two plus two equals five' → INCORRECT: Two plus two equals four\\n"
             f"- 'Paris is in Germany' → INCORRECT: Paris is the capital of France\\n"
+            f"- 'ChatGPT in the 1980s' → INCORRECT: ChatGPT was launched in November 2022\\n"
+            f"- 'people used iPhones in 1990' → INCORRECT: The iPhone was released in 2007\\n"
+            f"- 'World War 2 in 1920' → INCORRECT: World War 2 was from 1939-1945\\n"
+            f"- 'Bill Gates founded Apple' → INCORRECT: Apple was founded by Steve Jobs, Steve Wozniak, and Ronald Wayne\\n"
             f"- 'water boils at 50 degrees' → INCORRECT: Water boils at 100°C at sea level\\n"
-            f"- 'the Earth is flat' → INCORRECT: The Earth is approximately spherical\\n"
-            f"- 'I was a bit shocked' → CORRECT (no factual claim)\\n"
+            f"- 'I was shocked' → CORRECT (no factual claim)\\n"
             f"- 'I think it's interesting' → CORRECT (opinion)"
         )
         
-        logger.info(f"[FACT-CHECK] Checking with context ({len(full_context.split())} words): {transcript}")
+        logger.info(f"[FACT-CHECK] Checking statement: {transcript}")
+        logger.info(f"[FACT-CHECK] Full context ({len(full_context.split())} words): {full_context[:200]}...")
         
         try:
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a strict fact-checker analyzing conversations. Use the full conversation context to identify factual errors. Only flag clear, verifiable factual mistakes. Ignore grammar, opinions, and incomplete thoughts."},
+                    {"role": "system", "content": "You are a strict fact-checker analyzing conversations. Use the FULL CONVERSATION CONTEXT to identify factual errors. Pay special attention to dates, time periods, and historical events. Only flag clear, verifiable factual mistakes - especially anachronisms where events/technologies are placed in wrong time periods. Ignore grammar, opinions, and incomplete thoughts."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.05,  # Very deterministic
