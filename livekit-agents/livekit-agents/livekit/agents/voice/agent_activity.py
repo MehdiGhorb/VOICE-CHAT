@@ -1473,6 +1473,11 @@ class AgentActivity(RecognitionHooks):
             correction_message: The correction message from the fact-checker
         """
         try:
+            # Check if agent interruption is enabled
+            if not self._agent._enable_agent_interruption:
+                logger.info("[FACT-CHECK] Agent interruption is disabled, skipping correction")
+                return
+            
             logger.warning("[FACT-CHECK] >>> Agent interrupting to correct factual error <<<")
             
             # Mark that agent is now speaking FIRST (before everything else)

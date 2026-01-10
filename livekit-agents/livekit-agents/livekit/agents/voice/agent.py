@@ -50,6 +50,7 @@ class Agent:
         use_tts_aligned_transcript: NotGivenOr[bool] = NOT_GIVEN,
         min_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
         max_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
+        enable_agent_interruption: bool = True,
         interruption_phrase: str = "Actually",
     ) -> None:
         tools = tools or []
@@ -81,6 +82,7 @@ class Agent:
         self._use_tts_aligned_transcript = use_tts_aligned_transcript
         self._min_endpointing_delay = min_endpointing_delay
         self._max_endpointing_delay = max_endpointing_delay
+        self._enable_agent_interruption = enable_agent_interruption
         self._interruption_phrase = interruption_phrase
 
         if isinstance(mcp_servers, list) and len(mcp_servers) == 0:
