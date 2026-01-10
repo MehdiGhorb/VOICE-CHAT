@@ -1360,6 +1360,13 @@ class AgentActivity(RecognitionHooks):
     async def _analyze_pause_and_unblock(self) -> None:
         """Analyze pause and unblock turn completion based on result."""
         try:
+            # Check if pause detection is disabled
+            if not self._agent._enable_pause_detection:
+                logger.info("[PAUSE-DETECT] Pause detection is disabled, allowing immediate turn completion")
+                self._last_pause_was_complete = True
+                self._pause_analysis_complete.set()
+                return
+            
             # Get current transcript and context
             if not self._audio_recognition:
                 self._last_pause_was_complete = True

@@ -44,6 +44,7 @@ async def entrypoint(ctx: JobContext):
     # Still allows interruption detection but with lower latency
     min_endpointing_delay = config.get("min_endpointing_delay", 0.3)
     enable_interruption = config.get("enable_interruption", True)
+    enable_pause_detection = config.get("enable_pause_detection", True)
     interruption_phrase = config.get("interruption_phrase", "Actually")
     
     # Create emotion-aware agent with enhanced instructions
@@ -64,6 +65,7 @@ async def entrypoint(ctx: JobContext):
         ),
         min_endpointing_delay=min_endpointing_delay,
         enable_agent_interruption=enable_interruption,
+        enable_pause_detection=enable_pause_detection,
         interruption_phrase=interruption_phrase,
     )
     
