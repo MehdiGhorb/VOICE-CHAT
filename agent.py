@@ -43,6 +43,7 @@ async def entrypoint(ctx: JobContext):
     # Reduced default endpointing delay for faster response (0.3s vs 0.5s)
     # Still allows interruption detection but with lower latency
     min_endpointing_delay = config.get("min_endpointing_delay", 0.3)
+    interruption_phrase = config.get("interruption_phrase", "Actually")
     
     # Create emotion-aware agent with enhanced instructions
     agent = EmotionAwareAgent(
@@ -61,6 +62,7 @@ async def entrypoint(ctx: JobContext):
             model="sonic-3",
         ),
         min_endpointing_delay=min_endpointing_delay,
+        interruption_phrase=interruption_phrase,
     )
     
     # Use your own API keys directly (not LiveKit's managed services)

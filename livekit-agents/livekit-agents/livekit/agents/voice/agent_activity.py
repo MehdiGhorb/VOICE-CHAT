@@ -1502,9 +1502,10 @@ class AgentActivity(RecognitionHooks):
             
             # Use _generate_reply with clear, direct correction instruction
             # Now the LLM can see what the user said and respond appropriately
+            interruption_phrase = self._agent._interruption_phrase
             system_instruction = (
                 f"The user just made a factual error in their last message. "
-                f"Politely correct them by saying: 'Actually, {correction_message}' "
+                f"Politely correct them by saying: '{interruption_phrase}, {correction_message}' "
                 f"Keep your response brief and friendly - just correct the error, don't elaborate unless asked."
             )
             
