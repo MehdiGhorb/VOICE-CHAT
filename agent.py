@@ -46,16 +46,47 @@ async def entrypoint(ctx: JobContext):
     enable_interruption = config.get("enable_interruption", True)
     enable_pause_detection = config.get("enable_pause_detection", True)
     interruption_phrase = config.get("interruption_phrase", "Actually")
+    enable_filling_words = config.get("enable_filling_words", False)
+    
+    # Debug: Log configuration
+    print(f"🔧 Agent Configuration:")
+    print(f"  - Voice: {voice_id}")
+    print(f"  - Model: {model_name}")
+    print(f"  - Endpointing Delay: {min_endpointing_delay}")
+    print(f"  - Enable Interruption: {enable_interruption}")
+    print(f"  - Enable Pause Detection: {enable_pause_detection}")
+    print(f"  - Interruption Phrase: {interruption_phrase}")
+    print(f"  - Enable Filling Words: {enable_filling_words}")
+    
+    # Build base instructions
+    base_instructions = (
+        "You are a professional and helpful voice assistant built by LiveKit. "
+        "You communicate naturally and clearly. "
+        "You adapt your emotional tone based on the conversation context, "
+        "but maintain a generally neutral and professional demeanor. "
+        "Reserve emotional intonation for situations that genuinely warrant it."
+    )
+    
+    # Add filling words instruction if enabled
+    if enable_filling_words:
+        base_instructions += (
+            "\n\nNATURAL SPEECH WITH FILLER WORDS (CRITICAL):\n"
+            "- You MUST use filler words frequently to sound natural and human-like\n"
+            "- Common fillers to use: 'umm...', 'uh...', 'ok...', 'so...', 'well...', 'you know...', 'like...', 'I mean...'\n"
+            "- Add brief pauses with '...' to sound more thoughtful\n"
+            "- Examples:\n"
+            "  * 'Umm... let me think about that for a second'\n"
+            "  * 'Ok, so... what you're saying is...'\n"
+            "  * 'Well... I think the best approach would be...'\n"
+            "  * 'You know... that's actually a really good question'\n"
+            "  * 'So, umm... let me help you with that'\n"
+            "- Use 2-4 filler words per response on average\n"
+            "- Place fillers naturally at the beginning of sentences or during transitions"
+        )
     
     # Create emotion-aware agent with enhanced instructions
     agent = EmotionAwareAgent(
-        instructions=(
-            "You are a professional and helpful voice assistant built by LiveKit. "
-            "You communicate naturally and clearly. "
-            "You adapt your emotional tone based on the conversation context, "
-            "but maintain a generally neutral and professional demeanor. "
-            "Reserve emotional intonation for situations that genuinely warrant it."
-        ),
+        instructions=base_instructions,
         tools=[lookup_weather],
         stt=deepgram.STT(),
         llm=openai.LLM(model=model_name),
