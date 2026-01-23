@@ -15,6 +15,7 @@ from livekit.agents import (
 from livekit.agents.voice.emotion_aware_agent import EmotionAwareAgent
 from livekit.plugins import silero, deepgram, openai, cartesia
 from dotenv import load_dotenv
+import json
 load_dotenv('.env.local')
 
 @function_tool
@@ -25,9 +26,35 @@ async def lookup_weather(
     """Used to look up weather information."""
     return {"weather": "sunny", "temperature": 70}
 
+# Global room reference for log broadcasting
+current_room = None
+
+async def broadcast_log(log_type: str, data: dict):
+    """Send log data to frontend via LiveKit data channel"""
+    print(f"📡 broadcast_log called: type={log_type}, data={data}")
+    if current_room:
+        try:
+            log_message = json.dumps({
+                "type": log_type,
+                "data": data,
+                "timestamp": data.get("timestamp") or ""
+            })
+            print(f"✅ Sending log message: {log_message}")
+            await current_room.local_participant.publish_data(
+                log_message.encode('utf-8'),
+                reliable=False  # Use unreliable for low latency
+            )
+            print(f"✅ Log sent successfully")
+        except Exception as e:
+            print(f"❌ Error broadcasting log: {e}")
+    else:
+        print(f"⚠️ Cannot broadcast - current_room is None")
+
 
 async def entrypoint(ctx: JobContext):
+    global current_room
     await ctx.connect()
+    current_room = ctx.room
 
     # Get configuration from room metadata
     room_metadata = ctx.room.metadata or "{}"

@@ -5,6 +5,7 @@ import contextvars
 import heapq
 import json
 import openai
+import sys
 import time
 from collections.abc import AsyncIterable, Coroutine, Sequence
 from dataclasses import dataclass
@@ -1329,6 +1330,20 @@ class AgentActivity(RecognitionHooks):
             result = response.choices[0].message.content.strip()
             logger.info(f"[FACT-CHECK] Result: {result}")
             
+            # Broadcast to frontend
+            try:
+                import sys
+                agent_module = sys.modules.get('__main__')
+                if agent_module and hasattr(agent_module, 'broadcast_log'):
+                    is_correct = result == "CORRECT"
+                    correction = result.replace("INCORRECT:", "").strip() if not is_correct else None
+                    asyncio.create_task(agent_module.broadcast_log('fact-check', {
+                        'result': 'CORRECT' if is_correct else 'INCORRECT',
+                        'correction': correction
+                    }))
+            except Exception:
+                pass
+            
             # Check if factual error was found
             if result.startswith("INCORRECT:"):
                 correction = result.replace("INCORRECT:", "").strip()
@@ -1413,6 +1428,13 @@ class AgentActivity(RecognitionHooks):
             # Lower blocking threshold to reduce false blocks
             if not pause_analysis.is_complete_thought and pause_analysis.confidence >= 0.85:
                 logger.info(f"[PAUSE-DETECT] ⏸️  BLOCKING turn - user mid-thought (conf={pause_analysis.confidence:.2f})")
+                # Broadcast to frontend
+                agent_module = sys.modules.get('__main__')
+                if agent_module and hasattr(agent_module, 'broadcast_log'):
+                    asyncio.create_task(agent_module.broadcast_log('pause-detect', {
+                        'action': 'blocked',
+                        'confidence': pause_analysis.confidence
+                    }))
                 self._pause_analysis_complete.set()  # Unblock the check
                 return
             elif not pause_analysis.is_complete_thought:
@@ -1421,6 +1443,13 @@ class AgentActivity(RecognitionHooks):
             
             # User completed thought - allow turn completion
             logger.info(f"[PAUSE-DETECT] ✅ Turn complete - allowing response")
+            # Broadcast to frontend
+            agent_module = sys.modules.get('__main__')
+            if agent_module and hasattr(agent_module, 'broadcast_log'):
+                asyncio.create_task(agent_module.broadcast_log('pause-detect', {
+                    'action': 'allowed',
+                    'confidence': pause_analysis.confidence
+                }))
             self._pause_analysis_complete.set()  # Unblock turn completion
             
             # Check if AI has something valuable to add (for proactive responses)
@@ -1797,6 +1826,12 @@ class AgentActivity(RecognitionHooks):
                 f"[PAUSE-DETECT] 🚫 Suppressing turn completion - incomplete thought detected",
                 extra={"transcript": info.new_transcript}
             )
+            # Broadcast to frontend
+            agent_module = sys.modules.get('__main__')
+            if agent_module and hasattr(agent_module, 'broadcast_log'):
+                asyncio.create_task(agent_module.broadcast_log('pause-detect', {
+                    'action': 'suppressed'
+                }))
             # Don't proceed with turn completion - user is mid-thought
             return
         

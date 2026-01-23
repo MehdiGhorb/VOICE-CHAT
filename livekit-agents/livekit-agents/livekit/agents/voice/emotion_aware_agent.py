@@ -189,6 +189,19 @@ Remember: Your emotion choice will be expressed through voice tone automatically
                     f"Applying emotion '{emotion}' to TTS synthesis"
                 )
                 self.tts.update_options(emotion=emotion)
+                
+                # Broadcast emotion to frontend
+                try:
+                    import sys
+                    import os
+                    agent_module = sys.modules.get('__main__')
+                    if agent_module and hasattr(agent_module, 'broadcast_log'):
+                        import asyncio
+                        asyncio.create_task(agent_module.broadcast_log('emotion', {
+                            'emotion': emotion
+                        }))
+                except Exception:
+                    pass
             else:
                 logger.warning(
                     f"TTS provider {type(self.tts).__name__} may not support emotion control"
