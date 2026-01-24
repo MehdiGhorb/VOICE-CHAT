@@ -53,6 +53,9 @@ class Agent:
         enable_agent_interruption: bool = True,
         enable_pause_detection: bool = True,
         interruption_phrase: str = "Actually",
+        interrupt_on_factual_mistakes: bool = False,
+        interrupt_on_grammatical_mistakes: bool = False,
+        custom_interrupt_prompt: str | None = None,
     ) -> None:
         tools = tools or []
         if type(self) is Agent:
@@ -86,6 +89,9 @@ class Agent:
         self._enable_agent_interruption = enable_agent_interruption
         self._enable_pause_detection = enable_pause_detection
         self._interruption_phrase = interruption_phrase
+        self._interrupt_on_factual_mistakes = interrupt_on_factual_mistakes
+        self._interrupt_on_grammatical_mistakes = interrupt_on_grammatical_mistakes
+        self._custom_interrupt_prompt = custom_interrupt_prompt
 
         if isinstance(mcp_servers, list) and len(mcp_servers) == 0:
             mcp_servers = None  # treat empty list as None (but keep NOT_GIVEN)

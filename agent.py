@@ -74,6 +74,9 @@ async def entrypoint(ctx: JobContext):
     enable_pause_detection = config.get("enable_pause_detection", True)
     interruption_phrase = config.get("interruption_phrase", "Actually")
     enable_filling_words = config.get("enable_filling_words", False)
+    interrupt_on_factual_mistakes = config.get("interrupt_on_factual_mistakes", False)
+    interrupt_on_grammatical_mistakes = config.get("interrupt_on_grammatical_mistakes", False)
+    custom_interrupt_prompt = config.get("custom_interrupt_prompt", None)
     
     # Debug: Log configuration
     print(f"🔧 Agent Configuration:")
@@ -84,6 +87,9 @@ async def entrypoint(ctx: JobContext):
     print(f"  - Enable Pause Detection: {enable_pause_detection}")
     print(f"  - Interruption Phrase: {interruption_phrase}")
     print(f"  - Enable Filling Words: {enable_filling_words}")
+    print(f"  - Interrupt on Factual Mistakes: {interrupt_on_factual_mistakes}")
+    print(f"  - Interrupt on Grammatical Mistakes: {interrupt_on_grammatical_mistakes}")
+    print(f"  - Custom Interrupt Prompt: {custom_interrupt_prompt}")
     
     # Build base instructions
     base_instructions = (
@@ -125,6 +131,9 @@ async def entrypoint(ctx: JobContext):
         enable_agent_interruption=enable_interruption,
         enable_pause_detection=enable_pause_detection,
         interruption_phrase=interruption_phrase,
+        interrupt_on_factual_mistakes=interrupt_on_factual_mistakes,
+        interrupt_on_grammatical_mistakes=interrupt_on_grammatical_mistakes,
+        custom_interrupt_prompt=custom_interrupt_prompt,
     )
     
     # Use your own API keys directly (not LiveKit's managed services)

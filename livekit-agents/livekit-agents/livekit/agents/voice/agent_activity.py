@@ -5,7 +5,6 @@ import contextvars
 import heapq
 import json
 import openai
-import sys
 import time
 from collections.abc import AsyncIterable, Coroutine, Sequence
 from dataclasses import dataclass
@@ -1238,6 +1237,12 @@ class AgentActivity(RecognitionHooks):
         if self._is_agent_speaking:
             return
         
+        # Check if any interruption type is enabled
+        if not (self._agent._interrupt_on_factual_mistakes or 
+                self._agent._interrupt_on_grammatical_mistakes or 
+                self._agent._custom_interrupt_prompt):
+            return
+        
         # Don't check the same text twice
         if transcript == self._last_checked_transcript:
             return
@@ -1261,26 +1266,11 @@ class AgentActivity(RecognitionHooks):
         if not transcript_stripped:
             return
         
-        # For unpunctuated sentences, be more lenient if they contain potential factual claims
-        last_char = transcript_stripped[-1]
-        if last_char not in '.!?':
-            # Check for factual indicators: numbers, proper nouns (capitals), location words
-            has_factual_indicators = any([
-                any(char.isdigit() for char in transcript),  # Contains numbers
-                sum(1 for word in words if word and word[0].isupper() and word not in ['I', 'And', 'But', 'So', 'Or']) >= 2,  # 2+ capitalized words (proper nouns)
-            ])
-            
-            # If has factual indicators, require only 8 words, otherwise need 15
-            min_words = 8 if has_factual_indicators else 15
-            if len(words) < min_words:
-                return
-        
         self._last_checked_transcript = transcript
         
         client = openai.AsyncOpenAI()  # Uses OPENAI_API_KEY from environment
         
         # Build RICHER context - last 5 messages to capture temporal/historical context
-        # This is critical for catching errors like "ChatGPT in 1980s" where date is in earlier segment
         full_context = " ".join(self._user_transcript_buffer[-5:])  # Last 5 messages
         if transcript not in full_context:
             full_context = full_context + " " + transcript
@@ -1290,37 +1280,76 @@ class AgentActivity(RecognitionHooks):
         if len(context_words) > 200:
             full_context = " ".join(context_words[-200:])
         
-        prompt = (
-            f"Analyze this statement for factual errors using the FULL CONTEXT provided:\\n\\n"
-            f"FULL CONTEXT: \\\"{full_context}\\\"\\n\\n"
-            f"LATEST STATEMENT TO CHECK: \\\"{transcript}\\\"\\n\\n"
-            f"CRITICAL RULES:\\n"
-            f"1. ONLY flag CLEAR, VERIFIABLE factual errors (wrong math, geography, science, historical facts, DATES/TIME PERIODS)\\n"
-            f"2. **Pay special attention to TEMPORAL CLAIMS**: Check if events/technologies are placed in correct time periods\\n"
-            f"3. Use the FULL CONTEXT to identify dates, time periods, and historical references\\n"
-            f"4. Ignore opinions, incomplete sentences, grammar issues, or vague statements\\n"
-            f"5. If there is a factual error, respond: INCORRECT: [1-2 sentence correction]\\n"
-            f"6. Otherwise respond: CORRECT\\n\\n"
-            f"EXAMPLES:\\n"
-            f"- 'two plus two equals five' → INCORRECT: Two plus two equals four\\n"
-            f"- 'Paris is in Germany' → INCORRECT: Paris is the capital of France\\n"
-            f"- 'ChatGPT in the 1980s' → INCORRECT: ChatGPT was launched in November 2022\\n"
-            f"- 'people used iPhones in 1990' → INCORRECT: The iPhone was released in 2007\\n"
-            f"- 'World War 2 in 1920' → INCORRECT: World War 2 was from 1939-1945\\n"
-            f"- 'Bill Gates founded Apple' → INCORRECT: Apple was founded by Steve Jobs, Steve Wozniak, and Ronald Wayne\\n"
-            f"- 'water boils at 50 degrees' → INCORRECT: Water boils at 100°C at sea level\\n"
-            f"- 'I was shocked' → CORRECT (no factual claim)\\n"
-            f"- 'I think it's interesting' → CORRECT (opinion)"
+        # Build dynamic prompt based on enabled interruption types
+        prompt_parts = [
+            f"Analyze this statement using the FULL CONTEXT provided:\n\n",
+            f"FULL CONTEXT: \"{full_context}\"\n\n",
+            f"LATEST STATEMENT TO CHECK: \"{transcript}\"\n\n",
+        ]
+        
+        # Add specific checking criteria based on what's enabled
+        if self._agent._interrupt_on_factual_mistakes:
+            prompt_parts.append(
+                "CHECK FOR FACTUAL ERRORS:\n"
+                "- ONLY flag CLEAR, VERIFIABLE factual errors (wrong math, geography, science, historical facts, DATES/TIME PERIODS)\n"
+                "- Pay special attention to TEMPORAL CLAIMS: Check if events/technologies are placed in correct time periods\n"
+                "- Use the FULL CONTEXT to identify dates, time periods, and historical references\n"
+                "- Examples of factual errors:\n"
+                "  * 'two plus two equals five' → INCORRECT: Two plus two equals four\n"
+                "  * 'Paris is in Germany' → INCORRECT: Paris is the capital of France\n"
+                "  * 'ChatGPT in the 1980s' → INCORRECT: ChatGPT was launched in November 2022\n"
+                "  * 'World War 2 in 1920' → INCORRECT: World War 2 was from 1939-1945\n\n"
+            )
+        
+        if self._agent._interrupt_on_grammatical_mistakes:
+            prompt_parts.append(
+                "CHECK FOR GRAMMATICAL ERRORS:\n"
+                "- Flag incorrect verb tenses, subject-verb agreement issues, wrong word usage\n"
+                "- Check for common grammar mistakes that affect clarity\n"
+                "- Examples of grammatical errors:\n"
+                "  * 'He don't like it' → INCORRECT: He doesn't like it\n"
+                "  * 'I seen it yesterday' → INCORRECT: I saw it yesterday\n"
+                "  * 'She go to school' → INCORRECT: She goes to school\n"
+                "  * 'Between you and I' → INCORRECT: Between you and me\n\n"
+            )
+        
+        if self._agent._custom_interrupt_prompt:
+            prompt_parts.append(
+                f"CUSTOM INTERRUPTION CRITERIA:\n{self._agent._custom_interrupt_prompt}\n\n"
+            )
+        
+        # Add response format
+        prompt_parts.append(
+            "If there is an error based on the criteria above, respond: INCORRECT: [1-2 sentence correction]\n"
+            "Otherwise respond: CORRECT\n"
         )
+        
+        prompt = "".join(prompt_parts)
         
         logger.info(f"[FACT-CHECK] Checking statement: {transcript}")
         logger.info(f"[FACT-CHECK] Full context ({len(full_context.split())} words): {full_context[:200]}...")
         
         try:
+            # Build system message based on enabled checks
+            system_parts = ["You are analyzing conversations to identify errors."]
+            
+            if self._agent._interrupt_on_factual_mistakes:
+                system_parts.append("You check for factual inaccuracies and anachronisms.")
+            
+            if self._agent._interrupt_on_grammatical_mistakes:
+                system_parts.append("You check for grammatical mistakes in English.")
+            
+            if self._agent._custom_interrupt_prompt:
+                system_parts.append("You also apply custom interruption criteria provided by the user.")
+            
+            system_parts.append("Only flag clear errors. Ignore opinions and incomplete thoughts.")
+            
+            system_message = " ".join(system_parts)
+            
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a strict fact-checker analyzing conversations. Use the FULL CONVERSATION CONTEXT to identify factual errors. Pay special attention to dates, time periods, and historical events. Only flag clear, verifiable factual mistakes - especially anachronisms where events/technologies are placed in wrong time periods. Ignore grammar, opinions, and incomplete thoughts."},
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.05,  # Very deterministic
@@ -1428,13 +1457,6 @@ class AgentActivity(RecognitionHooks):
             # Lower blocking threshold to reduce false blocks
             if not pause_analysis.is_complete_thought and pause_analysis.confidence >= 0.85:
                 logger.info(f"[PAUSE-DETECT] ⏸️  BLOCKING turn - user mid-thought (conf={pause_analysis.confidence:.2f})")
-                # Broadcast to frontend
-                agent_module = sys.modules.get('__main__')
-                if agent_module and hasattr(agent_module, 'broadcast_log'):
-                    asyncio.create_task(agent_module.broadcast_log('pause-detect', {
-                        'action': 'blocked',
-                        'confidence': pause_analysis.confidence
-                    }))
                 self._pause_analysis_complete.set()  # Unblock the check
                 return
             elif not pause_analysis.is_complete_thought:
@@ -1443,13 +1465,6 @@ class AgentActivity(RecognitionHooks):
             
             # User completed thought - allow turn completion
             logger.info(f"[PAUSE-DETECT] ✅ Turn complete - allowing response")
-            # Broadcast to frontend
-            agent_module = sys.modules.get('__main__')
-            if agent_module and hasattr(agent_module, 'broadcast_log'):
-                asyncio.create_task(agent_module.broadcast_log('pause-detect', {
-                    'action': 'allowed',
-                    'confidence': pause_analysis.confidence
-                }))
             self._pause_analysis_complete.set()  # Unblock turn completion
             
             # Check if AI has something valuable to add (for proactive responses)
@@ -1826,12 +1841,6 @@ class AgentActivity(RecognitionHooks):
                 f"[PAUSE-DETECT] 🚫 Suppressing turn completion - incomplete thought detected",
                 extra={"transcript": info.new_transcript}
             )
-            # Broadcast to frontend
-            agent_module = sys.modules.get('__main__')
-            if agent_module and hasattr(agent_module, 'broadcast_log'):
-                asyncio.create_task(agent_module.broadcast_log('pause-detect', {
-                    'action': 'suppressed'
-                }))
             # Don't proceed with turn completion - user is mid-thought
             return
         
