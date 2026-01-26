@@ -13,7 +13,7 @@ room:
   empty_timeout: 300
   max_participants: 100
 logging:
-  level: info
+  level: debug
   sample: false
 webhook:
   api_key: devkey
