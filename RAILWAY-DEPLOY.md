@@ -17,7 +17,7 @@ Your voice-chat app will run on Railway with:
    - Set **Root Directory**: `voice-chat`
    - Set **Dockerfile Path**: `Dockerfile.livekit`
 5. Settings → Variables:
-   - Add: `LIVEKIT_KEYS=devkey: secret`
+   - Add: `LIVEKIT_KEYS=devkey: abcdef1234567890abcdef1234567890`
 6. Settings → Networking:
    - Click "Generate Domain" (you'll get something like `livekit-server.railway.app`)
    - Copy this URL - you'll need it!
@@ -36,7 +36,7 @@ Your voice-chat app will run on Railway with:
    DEEPGRAM_API_KEY=your-key-here
    CARTESIA_API_KEY=your-key-here
    LIVEKIT_API_KEY=devkey
-   LIVEKIT_API_SECRET=secret
+   LIVEKIT_API_SECRET=abcdef1234567890abcdef1234567890
    LIVEKIT_URL=ws://livekit-server.railway.internal:7880
    ```
    

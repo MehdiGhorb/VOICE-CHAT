@@ -5,7 +5,7 @@ rtc:
   use_external_ip: true
   # Railway will set this automatically
 keys:
-  devkey: secret
+  devkey: 9f3AqL2xK7mR8PZ4WcE6DThYBvN5JHUs
 turn:
   enabled: true
   # Railway provides public IP
