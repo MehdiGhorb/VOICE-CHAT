@@ -7,8 +7,7 @@ rtc:
 keys:
   devkey: 9f3AqL2xK7mR8PZ4WcE6DThYBvN5JHUs
 turn:
-  enabled: true
-  # Railway provides public IP
+  enabled: false
 room:
   auto_create: true
   empty_timeout: 300
