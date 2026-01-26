@@ -28,7 +28,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy agent code
 COPY agent.py .
-COPY .env.local .env.local
 
 # Run the agent using the start command that connects to LiveKit server
 CMD ["python", "agent.py", "start"]

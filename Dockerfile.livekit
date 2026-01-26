@@ -1,0 +1,12 @@
+# Simple LiveKit Server for Railway
+FROM livekit/livekit-server:latest
+
+# Copy config
+COPY livekit.railway.yaml /etc/livekit.yaml
+
+# Expose ports
+EXPOSE 7880
+EXPOSE 7881
+
+# Run LiveKit
+CMD ["livekit-server", "--config", "/etc/livekit.yaml"]
